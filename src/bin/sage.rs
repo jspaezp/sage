@@ -155,7 +155,7 @@ impl Runner {
         scorer: &Scorer,
         path: P,
         file_id: usize,
-    ) -> anyhow::Result<Vec<sage::scoring::Percolator>> {
+    ) -> anyhow::Result<ProcessedFile> {
         let sp = SpectrumProcessor::new(
             self.parameters.max_peaks,
             self.parameters.database.fragment_min_mz,
@@ -205,7 +205,7 @@ impl Runner {
             self.write_features(path, &features)?;
         }
 
-        Ok(features)
+        Ok(ProcessedFile { features, quant })
     }
 
     pub fn run(&self) -> anyhow::Result<()> {
@@ -222,16 +222,19 @@ impl Runner {
         );
 
         // Collect all matches into a single vector
-        let mut combined = self
+        let outputs = self
             .parameters
             .mzml_paths
             .iter()
             .enumerate()
             .flat_map(|(file_id, path)| self.process_file(&scorer, path, file_id))
-            .flat_map(|results| results)
             .collect::<Vec<_>>();
 
+
         if self.parameters.collective_fdr {
+            let (features, quant): (Vec<_>, Vec<_>)  = outputs.into_iter().map(|file| (file.features, file.quant.unwrap_or_default())).unzip();
+            let mut combined = features.into_iter().flat_map(|x| x).collect::<Vec<_>>();
+
             let passing = self.spectrum_fdr(&mut combined);
             info!("{} peptide-spectrum matches at 1% FDR", passing);
             self.write_features("search.pin", &combined)?;
