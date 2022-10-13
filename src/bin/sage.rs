@@ -84,7 +84,10 @@ impl Search {
         };
 
         let output_directory = match output_directory {
-            Some(p) => Some(p.as_ref().to_path_buf()),
+            Some(p) => {
+                std::fs::create_dir_all(p.as_ref())?;
+                Some(p.as_ref().to_path_buf())
+            }
             _ => request.output_directory,
         };
 
@@ -237,9 +240,11 @@ impl Runner {
             .flat_map(|(file_id, path)| self.process_file(&scorer, path, file_id))
             .collect::<Vec<_>>();
 
-
         if self.parameters.collective_fdr {
-            let (features, quant): (Vec<_>, Vec<_>)  = outputs.into_iter().map(|file| (file.features, file.quant.unwrap_or_default())).unzip();
+            let (features, quant): (Vec<_>, Vec<_>) = outputs
+                .into_iter()
+                .map(|file| (file.features, file.quant.unwrap_or_default()))
+                .unzip();
             let mut combined = features.into_iter().flat_map(|x| x).collect::<Vec<_>>();
 
             let passing = self.spectrum_fdr(&mut combined);
