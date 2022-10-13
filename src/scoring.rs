@@ -40,9 +40,10 @@ pub struct Percolator {
     pub proteins: String,
     /// Number of proteins assigned to this peptide sequence
     pub num_proteins: usize,
-    /// Arbitrary spectrum id
-    pub specid: usize,
+    /// Spectrum id - empty until search is done
+    pub specid: String,
     /// File identifier
+    #[serde(skip_serializing)]
     pub file_id: usize,
     /// MS2 scan number
     pub scannr: u32,
@@ -292,7 +293,7 @@ impl<'db> Scorer<'db> {
                 peptide_decoy_idx: peptide.idx,
                 proteins,
                 num_proteins,
-                specid: 0,
+                specid: String::default(),
                 scannr: query.scan as u32,
                 file_id: query.file_id,
                 label: peptide.label(),

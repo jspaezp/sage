@@ -127,6 +127,29 @@ impl Runner {
         sage::ml::qvalue::spectrum_q_value(features)
     }
 
+    fn write_features<P: AsRef<Path>>(
+        &self,
+        path: P,
+        features: &[sage::scoring::Percolator],
+    ) -> anyhow::Result<()> {
+        let mut path = self
+            .parameters
+            .output_directory
+            .clone()
+            .map(|mut dir| {
+                dir.push(path.as_ref());
+                dir
+            })
+            .unwrap_or(path.as_ref().to_path_buf());
+        path.set_extension("pin");
+
+        let mut wtr = csv::WriterBuilder::new().delimiter(b'\t').from_path(path)?;
+        for feat in features {
+            wtr.serialize(feat)?;
+        }
+        wtr.flush().map_err(anyhow::Error::from)
+    }
+
     fn process_file<P: AsRef<Path>>(
         &self,
         scorer: &Scorer,
@@ -173,23 +196,17 @@ impl Runner {
         });
 
         if !self.parameters.collective_fdr {
-            self.spectrum_fdr(&mut features);
+            let passing = self.spectrum_fdr(&mut features);
+            info!(
+                "{}: {} peptide-spectrum matches at 1% FDR",
+                path.as_ref().display(),
+                passing
+            );
+            self.write_features(path, &features)?;
         }
 
         Ok(features)
     }
-
-    // fn make_path(&self, path: &Path) -> std::io::Result<PathBuf> {
-    //     if let Some(dir) = self.parameters.output_directory.clone() {
-    //         if !dir.exists() {
-    //             std::fs::create_dir_all(&dir)?;
-    //         }
-    //         let base = match path.file_stem() {
-    //             Some(stem) => { dir.push(stem); dir},
-    //             None => dir,
-    //         };
-    //     }
-    // }
 
     pub fn run(&self) -> anyhow::Result<()> {
         let scorer = Scorer::new(
@@ -217,16 +234,8 @@ impl Runner {
         if self.parameters.collective_fdr {
             let passing = self.spectrum_fdr(&mut combined);
             info!("{} peptide-spectrum matches at 1% FDR", passing);
+            self.write_features("search.pin", &combined)?;
         }
-
-        let mut wtr = csv::WriterBuilder::new()
-            .delimiter(b'\t')
-            .from_path("results.sage.pin")?;
-
-        for feature in combined {
-            wtr.serialize(feature)?;
-        }
-        wtr.flush()?;
 
         Ok(())
     }
