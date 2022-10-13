@@ -62,7 +62,12 @@ struct Quant {
 }
 
 impl Search {
-    pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+    pub fn load<P: AsRef<Path>>(
+        path: P,
+        mzml_paths: Option<Vec<P>>,
+        fasta: Option<P>,
+        output_directory: Option<P>,
+    ) -> anyhow::Result<Self> {
         let mut file = std::fs::File::open(path)?;
         let mut request: Input = serde_json::from_reader(&mut file)?;
         if let Some(f) = fasta {
@@ -87,6 +92,8 @@ impl Search {
             database,
             quant: request.quant.unwrap_or_default(),
             collective_fdr: request.collective_fdr.unwrap_or(true),
+            mzml_paths,
+            output_directory,
             precursor_tol: request.precursor_tol,
             fragment_tol: request.fragment_tol,
             report_psms: request.report_psms.unwrap_or(1),
@@ -429,8 +436,14 @@ fn main() -> anyhow::Result<()> {
     let path = matches
         .get_one::<String>("parameters")
         .expect("required parameters");
+    let output_directory = matches.get_one::<String>("output_directory");
+    let fasta = matches.get_one::<String>("fasta");
+    let mzml_paths = matches
+        .get_many::<String>("mzml_paths")
+        .map(|vals| vals.collect());
 
-    let search = Search::load(path)?;
+    let mut search = Search::load(path, mzml_paths, fasta, output_directory)?;
+
     let db = search.database.clone().build()?;
 
     info!(
