@@ -43,7 +43,6 @@ pub struct Percolator {
     /// Spectrum id - empty until search is done
     pub specid: String,
     /// File identifier
-    #[serde(skip_serializing)]
     pub file_id: usize,
     /// MS2 scan number
     pub scannr: u32,

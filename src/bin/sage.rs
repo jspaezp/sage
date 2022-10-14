@@ -83,13 +83,12 @@ impl Search {
             _ => request.mzml_paths.expect("'mzml_paths' must be provided!"),
         };
 
-        let output_directory = match output_directory {
-            Some(p) => {
-                std::fs::create_dir_all(p.as_ref())?;
-                Some(p.as_ref().to_path_buf())
-            }
-            _ => request.output_directory,
-        };
+        let output_directory = output_directory
+            .map(|p| p.as_ref().to_path_buf())
+            .or(request.output_directory);
+        if let Some(dir) = &output_directory {
+            std::fs::create_dir_all(&dir)?;
+        }
 
         Ok(Search {
             database,
@@ -158,6 +157,56 @@ impl Runner {
             wtr.serialize(feat)?;
         }
         wtr.flush().map_err(anyhow::Error::from)
+    }
+
+    fn write_quant<P: AsRef<Path>>(
+        &self,
+        path: P,
+        quant: &[sage::tmt::TmtQuant],
+    ) -> anyhow::Result<()> {
+        if quant.is_empty() {
+            return Ok(());
+        }
+        let mut path = self
+            .parameters
+            .output_directory
+            .clone()
+            .map(|mut dir| {
+                dir.push(path.as_ref());
+                dir
+            })
+            .unwrap_or(path.as_ref().to_path_buf());
+        path.set_extension("csv");
+
+        let mut wtr = csv::WriterBuilder::new().from_path(path)?;
+
+        let mut headers = vec![
+            "file_id".into(),
+            "scannr".into(),
+            "ion_injection_time".into(),
+        ];
+        headers.extend(
+            self.parameters
+                .quant
+                .tmt
+                .as_ref()
+                .map(|tmt| tmt.headers())
+                .expect("TMT quant cannot be performed without setting this parameter"),
+        );
+
+        wtr.write_record(&headers)?;
+
+        for q in quant {
+            let mut record = vec![
+                q.file_id.to_string(),
+                q.scannr.to_string(),
+                q.ion_injection_time.to_string(),
+            ];
+            record.extend(q.peaks.iter().map(|x| x.to_string()));
+            wtr.write_record(&record)?;
+        }
+        wtr.flush()?;
+        Ok(())
     }
 
     fn process_file<P: AsRef<Path>>(
@@ -250,6 +299,9 @@ impl Runner {
             let passing = self.spectrum_fdr(&mut combined);
             info!("{} peptide-spectrum matches at 1% FDR", passing);
             self.write_features("search.pin", &combined)?;
+
+            let quant = quant.into_iter().flat_map(|x| x).collect::<Vec<_>>();
+            self.write_quant("quant.csv", &quant)?;
         }
 
         Ok(())
