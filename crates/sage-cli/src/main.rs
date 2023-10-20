@@ -273,7 +273,14 @@ impl Runner {
                 self.parameters.mzml_paths.len(),
             );
             let _ = sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
-            let _ = sage_core::ml::mobility_model::predict(&self.database, &mut outputs.features);
+            let mob_fit =
+                sage_core::ml::mobility_model::predict(&self.database, &mut outputs.features);
+            match mob_fit {
+                Some(_) => {}
+                None => {
+                    log::warn!("mobility model fitting failed");
+                }
+            }
             Some(alignments)
         } else {
             None

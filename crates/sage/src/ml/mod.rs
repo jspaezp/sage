@@ -4,10 +4,10 @@ pub mod gauss;
 pub mod kde;
 pub mod linear_discriminant;
 pub mod matrix;
+pub mod mobility_model;
 pub mod qvalue;
 pub mod retention_alignment;
 pub mod retention_model;
-pub mod mobility_model;
 
 #[allow(dead_code)]
 fn all_close(lhs: &[f64], rhs: &[f64], eps: f64) -> bool {

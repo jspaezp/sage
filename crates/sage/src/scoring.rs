@@ -432,7 +432,12 @@ impl<'db> Scorer<'db> {
                 // Features
                 charge: score.precursor_charge,
                 rt: query.scan_start_time,
-                ims: query.precursors.get(0).unwrap().inverse_ion_mobility.unwrap_or(0.0),
+                ims: query
+                    .precursors
+                    .get(0)
+                    .unwrap()
+                    .inverse_ion_mobility
+                    .unwrap_or(0.0),
                 delta_mass,
                 isotope_error,
                 average_ppm: score.ppm_difference,
