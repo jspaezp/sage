@@ -13,14 +13,20 @@ use rayon::prelude::*;
 /// Try to fit a retention time prediction model
 pub fn predict(db: &IndexedDatabase, features: &mut [Feature]) -> Option<()> {
     // Training LR might fail - not enough values, or r-squared is < 0.7
-    let lr = MobilityModel::fit(db, features)?;
+    let lr = match MobilityModel::fit(db, features) {
+        Some(lr) => lr,
+        None => {
+            log::warn!("Mobility model failed to train");
+            return None;
+        }
+    };
     features.par_iter_mut().for_each(|feat| {
         // LR can sometimes predict crazy values - clamp predicted RT
         let ims = lr.predict_peptide(db, feat);
         let bounded = ims.clamp(0.0, 2.0) as f32;
-        feat.predicted_ims = bounded.sqrt();
+        feat.predicted_ims = bounded;
 
-        feat.delta_ims_model = ((feat.ims * feat.ims) - bounded).abs();
+        feat.delta_ims_model = (feat.ims - bounded).abs();
     });
     Some(())
 }
@@ -30,9 +36,12 @@ pub struct MobilityModel {
     pub r2: f64,
 }
 
-const FEATURES: usize = VALID_AA.len() * 3 + 7;
-const N_TERMINAL: usize = VALID_AA.len();
-const C_TERMINAL: usize = VALID_AA.len() * 2;
+const FEATURES: usize = VALID_AA.len() + 7;
+
+// const FEATURES: usize = VALID_AA.len() * 2 + 7;
+// const N_TERMINAL: usize = VALID_AA.len();
+// const N_TERMINAL: usize = 0;
+// const C_TERMINAL: usize = VALID_AA.len();
 const FIRST_R: usize = FEATURES - 7;
 const FIRST_K: usize = FEATURES - 6;
 const PEPTIDE_MZ: usize = FEATURES - 5;
@@ -56,20 +65,20 @@ impl MobilityModel {
         let cterm = peptide.sequence.len().saturating_sub(3);
         let pep_length = peptide.sequence.len() as f64;
 
-        let default_first_val = 1.0f64;
-        // let default_first_val = 0f64;
+        //let default_first_val = 1.0f64;
+        let default_first_val = 0f64;
         embedding[FIRST_K] = default_first_val;
         embedding[FIRST_R] = default_first_val;
 
         for (aa_idx, residue) in peptide.sequence.iter().enumerate() {
             let idx = map[(residue - b'A') as usize];
             embedding[idx] += 1.0;
-            // Embed N- and C-terminal AA's (2 on each end, excluding K/R)
-            match aa_idx {
-                0 | 1 => embedding[N_TERMINAL + idx] += 1.0,
-                x if x == cterm || x == cterm + 1 => embedding[C_TERMINAL + idx] += 1.0,
-                _ => {}
-            }
+            // Embed N- and C-terminal AA's
+            // match aa_idx {
+            //     0 => embedding[N_TERMINAL + idx] += 1.0,
+            //     x if x == cterm => embedding[C_TERMINAL + idx] += 1.0,
+            //     _ => {}
+            // }
             match idx {
                 x if x == r_idx => {
                     if embedding[FIRST_R] == default_first_val {
@@ -110,9 +119,6 @@ impl MobilityModel {
             .map(|psm| psm.ims as f64)
             .collect::<Vec<f64>>();
 
-        // NOTE: Here the model is trained on the square mobilities.
-        let ims = ims.into_iter().map(|x| x * x).collect::<Vec<f64>>();
-
         let ims_mean = ims.iter().sum::<f64>() / ims.len() as f64;
         let ims_var = ims.iter().map(|rt| (rt - ims_mean).powi(2)).sum::<f64>();
 
@@ -131,17 +137,17 @@ impl MobilityModel {
         let cov = f_t.dot(&features);
         let b = f_t.dot(&rt);
 
-        log::info!("Solving beta");
         let beta = Gauss::solve(cov, b)?;
 
-        let predicted_rt = features.dot(&beta).take();
-        let sum_squared_error = predicted_rt
+        let predicted_im = features.dot(&beta).take();
+        let sum_squared_error = predicted_im
             .iter()
             .zip(rt.take())
             .map(|(pred, act)| (pred - act).powi(2))
             .sum::<f64>();
 
         let r2 = 1.0 - (sum_squared_error / ims_var);
+        log::info!("- fit mobility model, rsq = {}", r2);
         Some(Self {
             beta: beta.take(),
             map,
