@@ -55,7 +55,7 @@ const UNCHARGED_POLAR_AA_IDXS: [usize; 4] = [
 const POSITIVE_AA_IDXS: [usize; 3] = [
     b'R' as usize - b'A' as usize,
     b'K' as usize - b'A' as usize,
-    b'H' as usize - b'A' as usize, // at pH 7.0 ...
+    b'H' as usize - b'A' as usize,
 ];
 
 const NEGATIVE_AA_IDXS: [usize; 2] = [b'D' as usize - b'A' as usize, b'E' as usize - b'A' as usize];
@@ -88,9 +88,6 @@ const PEPTIDE_MZ: usize = FEATURES - 4;
 const PEPTIDE_LEN: usize = FEATURES - 3;
 const PEPTIDE_MASS: usize = FEATURES - 2;
 const INTERCEPT: usize = FEATURES - 1;
-
-// NOTE: Square mobilities are a lot more linear with respect to m/z
-// than linear mobs.
 
 // IN THEORY we could have only one model for both RT and IM
 // And the RT should ignore the charge state "at training time"
@@ -151,7 +148,7 @@ impl MobilityModel {
         embedding
     }
 
-    /// Attempt to fit a linear regression model: peptide sequence ~ retention time
+    /// Attempt to fit a linear regression model: peptide sequence + charge ~ retention time
     pub fn fit(db: &IndexedDatabase, training_set: &[Feature]) -> Option<Self> {
         // Create a mapping from amino acid character to vector embedding
         // Q: Why has this been implemented as a this map and not a hashmap[byte -> usize]?
