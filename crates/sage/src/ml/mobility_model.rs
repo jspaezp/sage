@@ -36,16 +36,55 @@ pub struct MobilityModel {
     pub r2: f64,
 }
 
-const FEATURES: usize = VALID_AA.len() + 7;
+const BULKY_AA_IDXS: [usize; 6] = [
+    b'L' as usize - b'A' as usize,
+    b'V' as usize - b'A' as usize,
+    b'I' as usize - b'A' as usize,
+    b'F' as usize - b'A' as usize,
+    b'W' as usize - b'A' as usize,
+    b'Y' as usize - b'A' as usize,
+];
 
-// const FEATURES: usize = VALID_AA.len() * 2 + 7;
-// const N_TERMINAL: usize = VALID_AA.len();
-// const N_TERMINAL: usize = 0;
-// const C_TERMINAL: usize = VALID_AA.len();
-const FIRST_R: usize = FEATURES - 7;
-const FIRST_K: usize = FEATURES - 6;
-const PEPTIDE_MZ: usize = FEATURES - 5;
-const PEPTIDE_CHARGE: usize = FEATURES - 4;
+const UNCHARGED_POLAR_AA_IDXS: [usize; 4] = [
+    b'S' as usize - b'A' as usize,
+    b'T' as usize - b'A' as usize,
+    b'N' as usize - b'A' as usize,
+    b'Q' as usize - b'A' as usize,
+];
+
+const POSITIVE_AA_IDXS: [usize; 3] = [
+    b'R' as usize - b'A' as usize,
+    b'K' as usize - b'A' as usize,
+    b'H' as usize - b'A' as usize, // at pH 7.0 ...
+];
+
+const NEGATIVE_AA_IDXS: [usize; 2] = [b'D' as usize - b'A' as usize, b'E' as usize - b'A' as usize];
+
+const TINY_AA_IDXS: [usize; 3] = [
+    b'G' as usize - b'A' as usize,
+    b'A' as usize - b'A' as usize,
+    b'S' as usize - b'A' as usize,
+];
+
+const BRANCHED_AA_IDXS: [usize; 3] = [
+    b'L' as usize - b'A' as usize,
+    b'I' as usize - b'A' as usize,
+    b'V' as usize - b'A' as usize,
+];
+
+const FEATURES: usize = VALID_AA.len() * 4 + 12;
+const PCT_FEATURES_START: usize = VALID_AA.len();
+const N_TERMINAL: usize = VALID_AA.len() * 2;
+const C_TERMINAL: usize = VALID_AA.len() * 3;
+const NUM_BRANCHED: usize = FEATURES - 12;
+const NUM_TINY: usize = FEATURES - 11;
+const NUM_UC_POLAR: usize = FEATURES - 10;
+const NUM_BULKY: usize = FEATURES - 9;
+const NUM_POSITIVE: usize = FEATURES - 8;
+const NUM_NEGATIVE: usize = FEATURES - 7;
+const INV_PEPTIDE_CHARGE: usize = FEATURES - 6;
+const PEPTIDE_CHARGE: usize = FEATURES - 5;
+const PEPTIDE_MZ: usize = FEATURES - 4;
 const PEPTIDE_LEN: usize = FEATURES - 3;
 const PEPTIDE_MASS: usize = FEATURES - 2;
 const INTERCEPT: usize = FEATURES - 1;
@@ -59,44 +98,52 @@ impl MobilityModel {
     /// One-hot encoding of peptide sequences into feature vector
     /// Note that this currently does not take into account any modifications
     fn embed(peptide: &Peptide, charge: &u8, map: &[usize; 26]) -> [f64; FEATURES] {
-        let k_idx: usize = map[(b'K' - b'A') as usize];
-        let r_idx: usize = map[(b'R' - b'A') as usize];
         let mut embedding = [0.0; FEATURES];
         let cterm = peptide.sequence.len().saturating_sub(3);
         let pep_length = peptide.sequence.len() as f64;
 
         //let default_first_val = 1.0f64;
-        let default_first_val = 0f64;
-        embedding[FIRST_K] = default_first_val;
-        embedding[FIRST_R] = default_first_val;
-
         for (aa_idx, residue) in peptide.sequence.iter().enumerate() {
             let idx = map[(residue - b'A') as usize];
             embedding[idx] += 1.0;
             // Embed N- and C-terminal AA's
-            // match aa_idx {
-            //     0 => embedding[N_TERMINAL + idx] += 1.0,
-            //     x if x == cterm => embedding[C_TERMINAL + idx] += 1.0,
-            //     _ => {}
-            // }
-            match idx {
-                x if x == r_idx => {
-                    if embedding[FIRST_R] == default_first_val {
-                        // embedding[FIRST_R] = (pep_length - aa_idx as f64)/pep_length;
-                        embedding[FIRST_R] = (aa_idx as f64 + 1.) / pep_length;
-                    }
-                }
-                x if x == k_idx => {
-                    if embedding[FIRST_K] == default_first_val {
-                        // embedding[FIRST_K] = (pep_length - aa_idx as f64)/pep_length;
-                        embedding[FIRST_K] = (aa_idx as f64 + 1.) / pep_length;
-                    }
-                }
+            // 2 on each end
+            match aa_idx {
+                0 | 1=> embedding[N_TERMINAL + idx] += 1.0,
+                x if x > cterm => embedding[C_TERMINAL + idx] += 1.0,
                 _ => {}
             }
+            let x = idx;
+
+            if BULKY_AA_IDXS.contains(&x) {
+                embedding[NUM_BULKY] += 1.0;
+            };
+            if UNCHARGED_POLAR_AA_IDXS.contains(&x) {
+                embedding[NUM_UC_POLAR] += 1.0;
+            };
+            if POSITIVE_AA_IDXS.contains(&x) {
+                embedding[NUM_POSITIVE] += 1.0
+            };
+            if NEGATIVE_AA_IDXS.contains(&x) {
+                embedding[NUM_NEGATIVE] += 1.0
+            };
+            if TINY_AA_IDXS.contains(&x) {
+                embedding[NUM_TINY] += 1.0
+            };
+            if BRANCHED_AA_IDXS.contains(&x) {
+                embedding[NUM_BRANCHED] += 1.0
+            };
         }
+
+        // PCT features are just the AA counts divided by the length of the peptide
+        for idx in 0..VALID_AA.len() {
+            let pct_val = embedding[idx] / pep_length;
+            embedding[PCT_FEATURES_START + idx] = pct_val;
+        }
+
         let charge_feature: f64 = *charge as f64;
         embedding[PEPTIDE_CHARGE] = charge_feature;
+        embedding[INV_PEPTIDE_CHARGE] = 1. / charge_feature;
         embedding[PEPTIDE_LEN] = peptide.sequence.len() as f64;
         embedding[PEPTIDE_MASS] = (peptide.monoisotopic as f64) / 1000.0;
         embedding[PEPTIDE_MZ] = ((peptide.monoisotopic as f64) / charge_feature) / 1000.0;
@@ -146,8 +193,9 @@ impl MobilityModel {
             .map(|(pred, act)| (pred - act).powi(2))
             .sum::<f64>();
 
+        let mse: f64 = sum_squared_error / predicted_im.len() as f64;
         let r2 = 1.0 - (sum_squared_error / ims_var);
-        log::info!("- fit mobility model, rsq = {}", r2);
+        log::info!("- fit mobility model, rsq = {}, mse = {}", r2, mse);
         Some(Self {
             beta: beta.take(),
             map,
@@ -181,14 +229,21 @@ mod test {
             .unwrap(),
             Peptide::try_from(Digest {
                 decoy: false,
-                sequence: "LERSLIEK".into(),
+                sequence: "LERSLIEWK".into(),
                 missed_cleavages: 0,
                 ..Default::default()
             })
             .unwrap(),
             Peptide::try_from(Digest {
                 decoy: false,
-                sequence: "LESLIEK".into(),
+                sequence: "LWESLIEK".into(),
+                missed_cleavages: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+            Peptide::try_from(Digest {
+                decoy: false,
+                sequence: "CHADWICK".into(),
                 missed_cleavages: 0,
                 ..Default::default()
             })
@@ -205,9 +260,40 @@ mod test {
             .map(|x| MobilityModel::embed(x, &charge, &map))
             .collect();
 
-        let first_ks = embeddings.iter().map(|x| x[FIRST_K]).collect::<Vec<f64>>();
-        let first_rs = embeddings.iter().map(|x| x[FIRST_R]).collect::<Vec<f64>>();
-        assert_eq!(first_ks, vec![0.375, 1.0, 1.0]);
-        assert_eq!(first_rs, vec![1.0, 0.375, 1.0]);
+        let k_idx = map[(b'K' - b'A') as usize];
+        let w_idx = map[(b'W' - b'A') as usize];
+        let l_idx = map[(b'L' - b'A') as usize];
+        let i_idx = map[(b'I' - b'A') as usize];
+
+        let l_nterm_counts = embeddings
+            .iter()
+            .map(|x| x[N_TERMINAL + l_idx])
+            .collect::<Vec<f64>>();
+        let k_nterm_counts = embeddings
+            .iter()
+            .map(|x| x[N_TERMINAL + k_idx])
+            .collect::<Vec<f64>>();
+        let k_cterm_counts = embeddings
+            .iter()
+            .map(|x| x[C_TERMINAL + k_idx])
+            .collect::<Vec<f64>>();
+        let w_nterm_counts = embeddings
+            .iter()
+            .map(|x| x[N_TERMINAL + w_idx])
+            .collect::<Vec<f64>>();
+        let w_cterm_counts = embeddings
+            .iter()
+            .map(|x| x[C_TERMINAL + w_idx])
+            .collect::<Vec<f64>>();
+        let i_cterm_counts = embeddings
+            .iter()
+            .map(|x| x[C_TERMINAL + i_idx])
+            .collect::<Vec<f64>>();
+        assert_eq!(l_nterm_counts, vec![1.0, 1.0, 1.0, 0.0,], "L N-term counts");
+        assert_eq!(k_nterm_counts, vec![0.0, 0.0, 0.0, 0.0,], "K N-term counts");
+        assert_eq!(w_nterm_counts, vec![0.0, 0.0, 1.0, 0.0,], "W N-term counts");
+        assert_eq!(k_cterm_counts, vec![1.0, 1.0, 1.0, 1.0,], "K C-term counts");
+        assert_eq!(w_cterm_counts, vec![0.0, 1.0, 0.0, 0.0,], "W C-term counts");
+        assert_eq!(i_cterm_counts, vec![0.0, 0.0, 0.0, 0.0,], "I C-term counts");
     }
 }
