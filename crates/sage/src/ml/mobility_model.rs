@@ -151,7 +151,6 @@ impl MobilityModel {
     /// Attempt to fit a linear regression model: peptide sequence + charge ~ retention time
     pub fn fit(db: &IndexedDatabase, training_set: &[Feature]) -> Option<Self> {
         // Create a mapping from amino acid character to vector embedding
-        // Q: Why has this been implemented as a this map and not a hashmap[byte -> usize]?
         let mut map = [0; 26];
         for (idx, aa) in VALID_AA.iter().enumerate() {
             map[(aa - b'A') as usize] = idx;
