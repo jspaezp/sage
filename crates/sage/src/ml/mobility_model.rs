@@ -32,6 +32,7 @@ pub fn predict(db: &IndexedDatabase, features: &mut [Feature]) -> Option<()> {
 }
 pub struct MobilityModel {
     beta: Vec<f64>,
+    res_beta: Vec<f64>,
     map: [usize; 26],
     pub r2: f64,
 }
@@ -72,6 +73,15 @@ const BRANCHED_AA_IDXS: [usize; 3] = [
     b'V' as usize - b'A' as usize,
 ];
 
+// FP stands for first pass
+const FP_INV_PEPTIDE_CHARGE: usize = 0;
+const FP_INTERCEPT: usize = 1;
+const FP_PEPTIDE_MZ: usize = 2;
+const FP_PEPTIDE_CHARGE: usize = 3;
+const FP_PEPTIDE_LEN: usize = 4;
+const FP_PEPTIDE_MASS: usize = 5;
+const FP_FEATURES: usize = 6;
+
 const FEATURES: usize = VALID_AA.len() * 4 + 12;
 const PCT_FEATURES_START: usize = VALID_AA.len();
 const N_TERMINAL: usize = VALID_AA.len() * 2;
@@ -94,8 +104,14 @@ const INTERCEPT: usize = FEATURES - 1;
 impl MobilityModel {
     /// One-hot encoding of peptide sequences into feature vector
     /// Note that this currently does not take into account any modifications
-    fn embed(peptide: &Peptide, charge: &u8, map: &[usize; 26]) -> [f64; FEATURES] {
+    fn embed(
+        peptide: &Peptide,
+        charge: &u8,
+        map: &[usize; 26],
+    ) -> ([f64; FEATURES], [f64; FP_FEATURES]) {
         let mut embedding = [0.0; FEATURES];
+        let mut fp_embedding = [0.0; FP_FEATURES];
+
         let cterm = peptide.sequence.len().saturating_sub(3);
         let pep_length = peptide.sequence.len() as f64;
 
@@ -106,7 +122,7 @@ impl MobilityModel {
             // Embed N- and C-terminal AA's
             // 2 on each end
             match aa_idx {
-                0 | 1=> embedding[N_TERMINAL + idx] += 1.0,
+                0 | 1 => embedding[N_TERMINAL + idx] += 1.0,
                 x if x > cterm => embedding[C_TERMINAL + idx] += 1.0,
                 _ => {}
             }
@@ -145,7 +161,15 @@ impl MobilityModel {
         embedding[PEPTIDE_MASS] = (peptide.monoisotopic as f64) / 1000.0;
         embedding[PEPTIDE_MZ] = ((peptide.monoisotopic as f64) / charge_feature) / 1000.0;
         embedding[INTERCEPT] = 1.0;
-        embedding
+
+        fp_embedding[FP_PEPTIDE_CHARGE] = charge_feature;
+        fp_embedding[FP_PEPTIDE_LEN] = peptide.sequence.len() as f64;
+        fp_embedding[FP_PEPTIDE_MASS] = (peptide.monoisotopic as f64) / 1000.0;
+        fp_embedding[FP_INV_PEPTIDE_CHARGE] = 1. / charge_feature;
+        fp_embedding[FP_PEPTIDE_MZ] = ((peptide.monoisotopic as f64) / charge_feature) / 1000.0;
+        fp_embedding[FP_INTERCEPT] = 1.0;
+
+        (embedding, fp_embedding)
     }
 
     /// Attempt to fit a linear regression model: peptide sequence + charge ~ retention time
@@ -163,48 +187,102 @@ impl MobilityModel {
             .collect::<Vec<f64>>();
 
         let ims_mean = ims.iter().sum::<f64>() / ims.len() as f64;
-        let ims_var = ims.iter().map(|rt| (rt - ims_mean).powi(2)).sum::<f64>();
+        let ims_var = ims.iter().map(|im| (im - ims_mean).powi(2)).sum::<f64>();
+        let im: Matrix = Matrix::col_vector(ims.clone());
 
-        let rt = Matrix::col_vector(ims);
-
-        let features = training_set
+        let features: Vec<([f64; FEATURES], [f64; FP_FEATURES])> = training_set
             .par_iter()
             .filter(|feat| feat.label == 1 && feat.spectrum_q <= 0.01)
-            .flat_map_iter(|psm| Self::embed(&db[psm.peptide_idx], &psm.charge, &map))
+            .map(|psm| Self::embed(&db[psm.peptide_idx], &psm.charge, &map))
+            .collect();
+
+        let sp_features = features.iter().flat_map(|x| x.0).collect::<Vec<_>>();
+        let fp_features = features.iter().flat_map(|x| x.1).collect::<Vec<_>>();
+
+        // Rows should be the same in both ...
+        let rows = fp_features.len() / FP_FEATURES;
+        let fp_features = Matrix::new(fp_features, rows, FP_FEATURES);
+        let sp_features = Matrix::new(sp_features, rows, FEATURES);
+        // SPLIT HERE
+
+        let fp_beta = Self::fit_beta(&fp_features, &im, ims_var)?;
+        let fp_predicted_im = fp_features.dot(&fp_beta.clone()).take();
+
+        let residuals = ims
+            .iter()
+            .zip(fp_predicted_im.iter())
+            .map(|(act, pred)| 1000f64 * (act - pred))
             .collect::<Vec<_>>();
+        let residual_mean = residuals.iter().sum::<f64>() / residuals.len() as f64;
+        let residual_var = residuals
+            .iter()
+            .map(|res| (res - residual_mean).powi(2))
+            .sum::<f64>();
 
-        let rows = features.len() / FEATURES;
-        let features = Matrix::new(features, rows, FEATURES);
+        let sp_beta = Self::fit_beta(
+            &sp_features,
+            &Matrix::col_vector(residuals.clone()),
+            residual_var,
+        )?;
+        let sp_predicted_residuals = sp_features.dot(&sp_beta).take();
 
-        let f_t = features.transpose();
-        let cov = f_t.dot(&features);
-        let b = f_t.dot(&rt);
-
-        let beta = Gauss::solve(cov, b)?;
-
-        let predicted_im = features.dot(&beta).take();
+        let predicted_im = fp_predicted_im
+            .iter()
+            .zip(sp_predicted_residuals.iter())
+            .map(|(pred, res)| pred + (res / 1000f64))
+            .collect::<Vec<_>>();
         let sum_squared_error = predicted_im
             .iter()
-            .zip(rt.take())
+            .zip(ims.iter())
             .map(|(pred, act)| (pred - act).powi(2))
             .sum::<f64>();
 
         let mse: f64 = sum_squared_error / predicted_im.len() as f64;
         let r2 = 1.0 - (sum_squared_error / ims_var);
+        log::info!("- debug... mse = {}, var {}, sse = {}", mse, ims_var, sum_squared_error);
         log::info!("- fit mobility model, rsq = {}, mse = {}", r2, mse);
         Some(Self {
-            beta: beta.take(),
+            beta: fp_beta.take(),
+            res_beta: sp_beta.take(),
             map,
             r2,
         })
     }
 
+    fn fit_beta(feature_mat: &Matrix, target_matrix: &Matrix, var: f64) -> Option<Matrix> {
+        let ff_t = feature_mat.transpose();
+        let fp_cov = ff_t.dot(&feature_mat);
+        let fp_b = ff_t.dot(&target_matrix);
+        let fp_beta = Gauss::solve(fp_cov, fp_b)?;
+
+        let predicted_im = feature_mat.dot(&fp_beta).clone().take();
+
+        let sum_squared_error = predicted_im
+            .iter()
+            .zip(target_matrix.clone().take())
+            .map(|(pred, act)| (pred - act).powi(2))
+            .sum::<f64>();
+
+        let mse: f64 = sum_squared_error / predicted_im.len() as f64;
+        log::info!("- debug... mse = {}, var {}, sse = {}", mse, var, sum_squared_error);
+        let r2 = 1.0 - (sum_squared_error / var);
+        log::info!("- fit model, rsq = {}, mse = {}", r2, mse);
+        Some(fp_beta)
+    }
+
     /// Predict retention times for a collection of PSMs
     pub fn predict_peptide(&self, db: &IndexedDatabase, psm: &Feature) -> f64 {
         let v = Self::embed(&db[psm.peptide_idx], &psm.charge, &self.map);
-        v.into_iter()
-            .zip(&self.beta)
-            .fold(0.0f64, |sum, (x, y)| sum + x * y)
+        let fp_v =
+            v.1.into_iter()
+                .zip(&self.beta)
+                .fold(0.0f64, |sum, (x, y)| sum + x * y);
+        let sp_v =
+            v.0.into_iter()
+                .zip(&self.res_beta)
+                .fold(0.0f64, |sum, (x, y)| sum + x * y);
+
+        fp_v + (sp_v / 1000f64)
     }
 }
 
@@ -253,7 +331,7 @@ mod test {
         }
         let embeddings: Vec<[f64; FEATURES]> = peps
             .iter()
-            .map(|x| MobilityModel::embed(x, &charge, &map))
+            .map(|x| MobilityModel::embed(x, &charge, &map).0)
             .collect();
 
         let k_idx = map[(b'K' - b'A') as usize];
