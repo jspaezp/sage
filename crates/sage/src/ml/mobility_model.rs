@@ -10,6 +10,21 @@ use crate::peptide::Peptide;
 use crate::scoring::Feature;
 use rayon::prelude::*;
 
+const CARRIER_MASS: f64 = 28.0;
+const SUMMARY_CONSTANT: f64 = 18509.8632163405;
+const TEMP: f64 = 305.00;
+
+fn pseudo_ccs(ook0: f64, z: f64, mass: f64) -> f64 {
+    let miu = (CARRIER_MASS * mass) / (CARRIER_MASS + mass);
+    (SUMMARY_CONSTANT * z) / ((miu * (TEMP)).sqrt() / ook0)
+}
+
+fn i_pseudo_ccs(pccs: f64, z: f64, mass: f64) -> f64 {
+    let miu = (CARRIER_MASS * mass) / (CARRIER_MASS + mass);
+    (((miu * (TEMP)).sqrt()) * pccs) / (SUMMARY_CONSTANT * z)
+}
+
+
 /// Try to fit a retention time prediction model
 pub fn predict(db: &IndexedDatabase, features: &mut [Feature]) -> Option<()> {
     // Training LR might fail - not enough values, or r-squared is < 0.7
@@ -22,10 +37,10 @@ pub fn predict(db: &IndexedDatabase, features: &mut [Feature]) -> Option<()> {
     };
     features.par_iter_mut().for_each(|feat| {
         // LR can sometimes predict crazy values - clamp predicted RT
-        let ims = lr.predict_peptide(db, feat);
+        let mut ims = lr.predict_peptide(db, feat);
+        ims = i_pseudo_ccs(ims as f64, feat.charge as f64, feat.expmass as f64);
         let bounded = ims.clamp(0.0, 2.0) as f32;
         feat.predicted_ims = bounded;
-
         feat.delta_ims_model = (feat.ims - bounded).abs();
     });
     Some(())
@@ -159,7 +174,7 @@ impl MobilityModel {
         let ims = training_set
             .par_iter()
             .filter(|feat| feat.label == 1 && feat.spectrum_q <= 0.01)
-            .map(|psm| psm.ims as f64)
+            .map(|psm| pseudo_ccs(psm.ims as f64, psm.charge as f64, psm.expmass as f64) as f64)
             .collect::<Vec<f64>>();
 
         let ims_mean = ims.iter().sum::<f64>() / ims.len() as f64;
