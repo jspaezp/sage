@@ -2,6 +2,13 @@ use clap::{value_parser, Arg, Command, ValueHint};
 use sage_cli::input::Input;
 use sage_cli::runner::Runner;
 
+#[cfg(target_os = "windows")]
+use mimalloc::MiMalloc;
+
+#[cfg(target_os = "windows")]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::default()
         .filter_level(log::LevelFilter::Error)
