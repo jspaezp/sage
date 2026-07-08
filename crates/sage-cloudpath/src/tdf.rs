@@ -10,20 +10,25 @@ use timsrust::core::utils::reader::Reader as TimsRustReader;
 use timsrust::core::{AcquisitionType, Converter, Frame, Im, MSLevel, Mz, ScanIndex, TofIndex};
 use timsrust::tdf::{Metadata, TDFPath, TDFSpectrumReader};
 use timsrust::{ImConverter, MzConverter, SpectrumReader, TimsTofPath};
-use timsrust_calibration::{CalibratedTof2MzConverter, RunCalibration};
+use timsrust_calibration::{CalibratedScan2ImConverter, CalibratedTof2MzConverter, RunCalibration};
 
 pub struct TdfReader;
 
-/// Name of the env var that toggles which TOF-index -> m/z converter is
-/// applied to fragment (MS2) and MS1 peak m/z when reading Bruker `.d`
-/// (TDF) data. Set to `physical` (or `1`) to use the physical calibration
-/// built from the run's own `analysis.tdf` calibration tables
+/// Name of the env var that toggles physical calibration when reading
+/// Bruker `.d` (TDF) data. Set to `physical` (or `1`) to use the physical
+/// calibration built from the run's own `analysis.tdf` calibration tables
 /// (`timsrust-calibration`); unset or any other value uses the stock
-/// (uncalibrated, sqrt-linear) timsrust converter.
+/// (uncalibrated) timsrust converters.
+///
+/// When enabled, BOTH the TOF-index -> m/z converter (applied to fragment
+/// MS2 and MS1 peak m/z) AND the scan-index -> ion-mobility (1/K0)
+/// converter (applied to MS1 peaks and recomputed precursor mobility) are
+/// swapped to the physical model. So the toggle is a single on/off switch
+/// for full physical calibration (m/z + IM).
 ///
 /// Precursor m/z is a stored Bruker value (not TOF-derived) and is never
-/// affected by this toggle. Ion mobility uses the stock converter in both
-/// modes.
+/// affected by this toggle. Precursor mobility, however, IS TOF/scan-derived
+/// and is recomputed from the precursor scan index in the calibrated arm.
 const CALIBRATION_ENV_VAR: &str = "SAGE_TDF_CALIBRATION";
 
 fn physical_calibration_requested() -> bool {
@@ -54,9 +59,35 @@ impl Converter<TofIndex, Mz> for ChosenMzConverter {
     }
 }
 
+/// The scan-index -> ion-mobility (1/K0) converter selected for a given
+/// file, per [`CALIBRATION_ENV_VAR`]. Wraps either the stock timsrust
+/// converter or the physical-calibration converter from
+/// `timsrust-calibration`.
+#[derive(Clone)]
+enum ChosenImConverter {
+    Stock(ImConverter),
+    Calibrated(CalibratedScan2ImConverter),
+}
+
+impl Converter<ScanIndex, Im> for ChosenImConverter {
+    fn convert(&self, value: ScanIndex) -> Im {
+        match self {
+            ChosenImConverter::Stock(c) => c.convert(value),
+            ChosenImConverter::Calibrated(c) => c.convert(value),
+        }
+    }
+}
+
+/// The m/z and IM converters selected for a file. In the calibrated arm
+/// both are built from a single [`RunCalibration`] instance (read once).
+struct ChosenConverters {
+    mz: ChosenMzConverter,
+    im: ChosenImConverter,
+}
+
 /// Read the env var once (per file parse) and build the corresponding
-/// fragment/MS1 m/z converter. Logs which mode is active at INFO.
-fn select_mz_converter(path: &TimsTofPath) -> ChosenMzConverter {
+/// m/z + IM converters. Logs which mode is active at INFO.
+fn select_converters(path: &TimsTofPath) -> ChosenConverters {
     if physical_calibration_requested() {
         let tdf_path = TDFPath::new(path).expect(
             "SAGE_TDF_CALIBRATION=physical requires a genuine Bruker TDF (.d) dataset",
@@ -64,26 +95,39 @@ fn select_mz_converter(path: &TimsTofPath) -> ChosenMzConverter {
         let analysis_tdf = tdf_path.tdf().as_path().expect(
             "analysis.tdf must resolve to a local filesystem path for physical calibration",
         );
+        // One RunCalibration instance backs both converters.
         let run_calibration = RunCalibration::from_path(analysis_tdf.to_string_lossy())
             .expect("failed to read physical calibration tables from analysis.tdf");
-        let converter = run_calibration
+        let mz = run_calibration
             .mz_converter_median()
             .expect("failed to build physical (timsrust-calibration) m/z converter");
+        let im = run_calibration
+            .im_converter_median()
+            .expect("failed to build physical (timsrust-calibration) IM converter");
         log::info!(
-            "{}=physical: using timsrust-calibration physical m/z converter for {}",
+            "{}=physical: using timsrust-calibration physical m/z + IM converters for {}",
             CALIBRATION_ENV_VAR,
             path.as_ref()
         );
-        ChosenMzConverter::Calibrated(converter)
+        ChosenConverters {
+            mz: ChosenMzConverter::Calibrated(mz),
+            im: ChosenImConverter::Calibrated(im),
+        }
     } else {
-        let converter = path
+        let mz = path
             .mz_converter()
             .expect("no m/z calibration for this timsTOF dataset");
+        let im = path
+            .im_converter()
+            .expect("no IM calibration for this timsTOF dataset");
         log::info!(
-            "using stock (uncalibrated) timsrust m/z converter for {}",
+            "using stock (uncalibrated) timsrust m/z + IM converters for {}",
             path.as_ref()
         );
-        ChosenMzConverter::Stock(converter)
+        ChosenConverters {
+            mz: ChosenMzConverter::Stock(mz),
+            im: ChosenImConverter::Stock(im),
+        }
     }
 }
 
@@ -239,19 +283,22 @@ impl TdfReader {
         let path_str = path_name.as_ref().to_string_lossy().into_owned();
         let path = TimsTofPath::new(&path_str)?;
 
-        // Read the env-var calibration toggle once per file; reused for
-        // both the MS2 (fragment) and MS1 peak m/z below. Precursor m/z is
-        // untouched (stored Bruker value).
-        let mz_converter = select_mz_converter(&path);
+        // Read the env-var calibration toggle once per file; the m/z
+        // converter drives MS2 fragment + MS1 peak m/z, the IM converter
+        // drives MS1 peak + precursor mobility. Precursor m/z is untouched
+        // (stored Bruker value).
+        let converters = select_converters(&path);
 
         let mut spectra = match Self::open_raw_tof_spectrum_reader(&path, &path_str, &config)? {
-            Some(spectrum_reader) => self.read_msn_spectra(file_id, &spectrum_reader, &mz_converter)?,
+            Some(spectrum_reader) => {
+                self.read_msn_spectra(file_id, &spectrum_reader, &converters)?
+            }
             None => {
                 if physical_calibration_requested() {
                     log::warn!(
                         "{}=physical requested but '{}' is not a plain Bruker DDA-TDF dataset \
                          (MiniTdf/TSF/Parquet, or DIA-PASEF); falling back to the stock \
-                         (uncalibrated) reader for MS2 fragment m/z in this file",
+                         (uncalibrated) reader for MS2 fragment m/z + precursor IM in this file",
                         CALIBRATION_ENV_VAR,
                         path_str
                     );
@@ -264,7 +311,7 @@ impl TdfReader {
             }
         };
         if requires_ms1 {
-            let ms1s = self.read_ms1_spectra(&path, file_id, config.ms1, &mz_converter)?;
+            let ms1s = self.read_ms1_spectra(&path, file_id, config.ms1, &converters)?;
             spectra.extend(ms1s);
         }
 
@@ -314,13 +361,12 @@ impl TdfReader {
         path: &TimsTofPath,
         file_id: usize,
         config: BrukerMS1CentoidingConfig,
-        mz_converter: &ChosenMzConverter,
+        converters: &ChosenConverters,
     ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
         let start = std::time::Instant::now();
         let frame_reader = timsrust::tdf::TdfFrameReader::new(path)?;
-        let ims_converter = path
-            .im_converter()
-            .expect("no IM calibration for this timsTOF dataset");
+        let mz_converter = &converters.mz;
+        let ims_converter = &converters.im;
         let tol_ppm = config.mz_ppm;
         let im_tol_pct = config.ims_pct;
 
@@ -347,7 +393,7 @@ impl TdfReader {
                 |buffer, frame| match frame {
                     Ok(frame) => {
                         buffer.clear();
-                        buffer.with_frame(&frame, &ims_converter, mz_converter);
+                        buffer.with_frame(&frame, ims_converter, mz_converter);
 
                         // Squash the mobility dimension
                         let (mz, (intensity, mobility)): (Vec<f32>, (Vec<f32>, Vec<f32>)) =
@@ -392,20 +438,31 @@ impl TdfReader {
 
     /// MS2 path used when `path` is a plain Bruker DDA-TDF dataset: reads
     /// raw `Spectrum<TofIndex>` directly from the tdf-level reader and
-    /// converts fragment m/z with the env-selected `mz_converter` (stock or
-    /// physically calibrated). Precursor m/z is untouched.
+    /// converts fragment m/z with the env-selected m/z converter (stock or
+    /// physically calibrated). Precursor m/z is untouched (stored value),
+    /// but precursor mobility is recomputed from the precursor scan index
+    /// with the calibrated IM converter in the physical arm (in the stock
+    /// arm the stored `dda_precursor.im()` is kept, bit-identical to before).
     fn read_msn_spectra(
         &self,
         file_id: usize,
         spectrum_reader: &TDFSpectrumReader<ImConverter>,
-        mz_converter: &ChosenMzConverter,
+        converters: &ChosenConverters,
     ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
+        let mz_converter = &converters.mz;
         let spectra: Vec<RawSpectrum> = (0..spectrum_reader.len())
             .into_par_iter()
             .filter_map(|index| match spectrum_reader.get(index) {
                 Ok(dda_spectrum) => match dda_spectrum.precursor() {
                     Some(dda_precursor) => {
                         let mut precursor = Self::parse_precursor(dda_precursor);
+                        // Precursor mobility is scan-derived, so recompute it
+                        // with the calibrated IM converter when active. The
+                        // stock arm keeps the stored value untouched.
+                        if let ChosenImConverter::Calibrated(im) = &converters.im {
+                            let mob = im.convert(dda_precursor.scan_index());
+                            precursor.inverse_ion_mobility = Some(f64::from(mob) as f32);
+                        }
                         let width = f64::from(dda_spectrum.isolation_window().width()) as f32;
                         precursor.isolation_window =
                             Option::from(Tolerance::Da(-width / 2.0, width / 2.0));
