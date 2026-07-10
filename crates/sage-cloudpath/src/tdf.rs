@@ -6,9 +6,14 @@ use sage_core::{
 use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, path::Path};
 use timsrust::core::AcquisitionType;
-use timsrust::core::{Converter, Frame, Im, MSLevel, Mz, ScanIndex, TofIndex};
-use timsrust::tdf::{Metadata, TDFPath};
+use timsrust::core::{Converter, Frame, Im, InvertibleConverter, MSLevel, Mz, ScanIndex, TofIndex};
+use timsrust::tdf::{Metadata, TDFPath, TDFSpectrumReader};
 use timsrust::{ImConverter, MzConverter, SpectrumReader, TimsTofPath};
+
+// Used by the physical-calibration path.
+use std::sync::Arc;
+use timsrust::core::utils::reader::Reader as _;
+use timsrust_calibration::{CalibratedScan2ImConverter, CalibratedTof2MzConverter, RunCalibration};
 
 pub struct TdfReader;
 
@@ -43,6 +48,58 @@ fn is_diapasef(path_str: &str) -> bool {
     Metadata::new(&tdf_path)
         .map(|m| m.acquisition_type() == AcquisitionType::DIAPASEF)
         .unwrap_or(false)
+}
+
+/// Set to any value to skip physical calibration and use the stock timsrust
+/// converters. Unset (the default) attempts calibration per file.
+const DISABLE_CALIBRATION_ENV_VAR: &str = "SAGE_TDF_DISABLE_CALIBRATION";
+
+fn calibration_disabled() -> bool {
+    std::env::var_os(DISABLE_CALIBRATION_ENV_VAR).is_some()
+}
+
+/// The physical (`timsrust-calibration`) m/z + IM converters for one file, both
+/// built from a single [`RunCalibration`] read.
+struct PhysicalConverters {
+    mz: CalibratedTof2MzConverter,
+    im: CalibratedScan2ImConverter,
+}
+
+/// The physical converters for a file, or `None` (use stock converters) when
+/// calibration is opted out or cannot be built. Failures warn, never fail.
+fn select_converters(path: &TimsTofPath, path_str: &str) -> Option<PhysicalConverters> {
+    if calibration_disabled() {
+        return None;
+    }
+    match build_physical_converters(path_str) {
+        Ok(converters) => {
+            log::info!(
+                "applying timsrust-calibration physical m/z + IM converters for {}",
+                path.as_ref()
+            );
+            Some(converters)
+        }
+        Err(err) => {
+            log::warn!(
+                "physical calibration unavailable for {}: {}; \
+                 falling back to stock converters",
+                path.as_ref(),
+                err
+            );
+            None
+        }
+    }
+}
+
+/// Build the physical converters from the run's own calibration tables.
+/// `path` may be the `.d` directory or the `analysis.tdf` file.
+fn build_physical_converters(
+    path: &str,
+) -> Result<PhysicalConverters, timsrust_calibration::CalibrationError> {
+    let run_calibration = RunCalibration::from_path(path)?;
+    let mz = run_calibration.mz_converter_median()?;
+    let im = run_calibration.im_converter_median()?;
+    Ok(PhysicalConverters { mz, im })
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy)]
@@ -126,12 +183,27 @@ impl TdfReader {
         let path_str = path_name.as_ref().to_string_lossy().into_owned();
         let path = TimsTofPath::new(&path_str)?;
 
+        // `None` (opted out, or unbuildable) falls through to the stock path.
+        if let Some(converters) = select_converters(&path, &path_str) {
+            return self.parse_calibrated(
+                file_id,
+                &path,
+                &path_str,
+                config,
+                requires_ms1,
+                &converters,
+            );
+        }
+
         if is_diapasef(&path_str) {
             log::warn!(
                 "{path_str}: DIA-PASEF read — timsrust centroider (precursor detection); \
                  stock (uncalibrated) converters; MS2 processing params ignored"
             );
-            let mut spectra = self.read_dia_ms2_timsrust(&path, file_id)?;
+            let mz_converter = require_mz_converter(&path)?;
+            let ims_converter = require_im_converter(&path)?;
+            let mut spectra =
+                self.read_dia_ms2_timsrust(&path, file_id, &mz_converter, &ims_converter)?;
             if requires_ms1 {
                 spectra.extend(self.read_ms1_spectra(&path, file_id, config.ms1)?);
             }
@@ -157,10 +229,27 @@ impl TdfReader {
         file_id: usize,
         config: BrukerMS1CentoidingConfig,
     ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
-        let start = std::time::Instant::now();
-        let frame_reader = timsrust::tdf::TdfFrameReader::new(path)?;
         let mz_converter = require_mz_converter(path)?;
         let ims_converter = require_im_converter(path)?;
+        self.centroid_ms1_frames(path, file_id, config, &mz_converter, &ims_converter)
+    }
+
+    /// Centroid MS1 frames with the supplied converters. Generic so both the
+    /// stock and the physical (`timsrust-calibration`) converters drive it.
+    fn centroid_ms1_frames<M, I>(
+        &self,
+        path: &TimsTofPath,
+        file_id: usize,
+        config: BrukerMS1CentoidingConfig,
+        mz_converter: &M,
+        ims_converter: &I,
+    ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError>
+    where
+        M: Converter<TofIndex, Mz> + Sync,
+        I: Converter<ScanIndex, Im> + Sync,
+    {
+        let start = std::time::Instant::now();
+        let frame_reader = timsrust::tdf::TdfFrameReader::new(path)?;
         let tol_ppm = config.mz_ppm;
         let im_tol_pct = config.ims_pct;
 
@@ -186,7 +275,7 @@ impl TdfReader {
                 |buffer, frame| match frame {
                     Ok(frame) => {
                         buffer.clear();
-                        buffer.with_frame(&frame, &ims_converter, &mz_converter);
+                        buffer.with_frame(&frame, ims_converter, mz_converter);
 
                         // Squash the mobility dimension
                         let (mz, (intensity, mobility)): (Vec<f32>, (Vec<f32>, Vec<f32>)) =
@@ -286,17 +375,22 @@ impl TdfReader {
 
     /// DIA-PASEF MS2 via timsrust's centroider: it deisotopes each MS1 frame to
     /// find precursors, then extracts a mobility-narrow MS2 spectrum per
-    /// detected precursor.
-    fn read_dia_ms2_timsrust(
+    /// detected precursor. Generic over the converters, so fragment m/z and
+    /// precursor 1/K0 are calibrated whenever calibrated converters are passed.
+    fn read_dia_ms2_timsrust<M, I>(
         &self,
         path: &TimsTofPath,
         file_id: usize,
-    ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
+        mz_converter: &M,
+        ims_converter: &I,
+    ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError>
+    where
+        M: Converter<TofIndex, Mz> + Clone + Sync + Send,
+        I: InvertibleConverter<ScanIndex, Im> + Clone + Sync + Send,
+    {
         use timsrust::core::utils::reader::ParIterableReader as _;
 
         let frame_reader = timsrust::tdf::TdfFrameReader::new(path)?.into_inner();
-        let mz_converter = require_mz_converter(path)?;
-        let ims_converter = require_im_converter(path)?;
         // Args: min_ms1_ion_count, min_ms2_ion_count, min_spectrum_size, use_precursors.
         let reader = timsrust::centroid::spectrum_reader::SpectrumReader::new(
             frame_reader,
@@ -304,7 +398,7 @@ impl TdfReader {
             2.0,
             5,
             true,
-            ims_converter,
+            ims_converter.clone(),
             mz_converter.clone(),
         )
         .map_err(|e| {
@@ -341,6 +435,149 @@ impl TdfReader {
                     intensity,
                     mobility: None,
                 })
+            })
+            .collect();
+        Ok(spectra)
+    }
+}
+
+/// The read paths taken when physical calibration is active.
+impl TdfReader {
+    /// Calibrated variant of [`Self::parse`]. Datasets the raw tdf reader
+    /// cannot serve (MiniTdf/TSF/Parquet) fall back to the stock facade reader.
+    fn parse_calibrated(
+        &self,
+        file_id: usize,
+        path: &TimsTofPath,
+        path_str: &str,
+        config: BrukerProcessingConfig,
+        requires_ms1: bool,
+        converters: &PhysicalConverters,
+    ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
+        if is_diapasef(path_str) {
+            log::warn!(
+                "{path_str}: DIA-PASEF read with physical calibration — timsrust centroider \
+                 (precursor detection); MS2 processing params ignored"
+            );
+            let mut spectra =
+                self.read_dia_ms2_timsrust(path, file_id, &converters.mz, &converters.im)?;
+            if requires_ms1 {
+                spectra.extend(self.centroid_ms1_frames(
+                    path,
+                    file_id,
+                    config.ms1,
+                    &converters.mz,
+                    &converters.im,
+                )?);
+            }
+            return Ok(spectra);
+        }
+
+        log::warn!(
+            "{path_str}: physical calibration active — fragment m/z, precursor 1/K0, and MS1 \
+             recalibrated; SpectrumProcessingParams.calibrate/calibration_tolerance are inert"
+        );
+        let mut spectra = match Self::open_raw_tof_spectrum_reader(path, path_str, &config)? {
+            Some(spectrum_reader) => {
+                self.read_msn_spectra_calibrated(file_id, &spectrum_reader, converters)?
+            }
+            None => {
+                log::warn!(
+                    "physical calibration requested but '{}' is not a plain Bruker DDA-TDF \
+                     dataset (MiniTdf/TSF/Parquet); falling back to the stock (uncalibrated) \
+                     reader for MS2 fragment m/z + precursor IM in this file",
+                    path_str
+                );
+                let spectrum_reader = SpectrumReader::build()
+                    .with_path(path)
+                    .with_config(config.ms2.into_timsrust())
+                    .finalize()?;
+                self.read_msn_spectra(file_id, &spectrum_reader)?
+            }
+        };
+        if requires_ms1 {
+            let ms1s = self.centroid_ms1_frames(
+                path,
+                file_id,
+                config.ms1,
+                &converters.mz,
+                &converters.im,
+            )?;
+            spectra.extend(ms1s);
+        }
+        Ok(spectra)
+    }
+
+    /// A raw (`Spectrum<TofIndex>`) MS2 reader from the tdf-level API, which
+    /// leaves fragment m/z unconverted rather than applying the facade's stock
+    /// conversion. `Ok(None)` when `path` isn't a plain Bruker DDA-TDF dataset.
+    fn open_raw_tof_spectrum_reader(
+        path: &TimsTofPath,
+        path_str: &str,
+        config: &BrukerProcessingConfig,
+    ) -> Result<Option<TDFSpectrumReader<ImConverter>>, timsrust::TimsRustError> {
+        let tdf_path = match TDFPath::new(path_str) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+
+        let im_converter = Arc::new(require_im_converter(path)?);
+        let reader = TDFSpectrumReader::build()
+            .with_path(&tdf_path)
+            .with_config(config.ms2.into_timsrust())
+            .with_im_converter(im_converter)
+            .finalize()
+            .map_err(timsrust::SpectrumReaderError::from)?;
+        Ok(Some(reader))
+    }
+
+    /// DDA MS2 with fragment m/z converted by the physical converter. Precursor
+    /// m/z is a stored value, so it is left untouched.
+    fn read_msn_spectra_calibrated(
+        &self,
+        file_id: usize,
+        spectrum_reader: &TDFSpectrumReader<ImConverter>,
+        converters: &PhysicalConverters,
+    ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
+        let spectra: Vec<RawSpectrum> = (0..spectrum_reader.len())
+            .into_par_iter()
+            .filter_map(|index| match spectrum_reader.get(index) {
+                Ok(dda_spectrum) => match dda_spectrum.precursor() {
+                    Some(dda_precursor) => {
+                        let mut precursor = Self::parse_precursor(dda_precursor);
+                        // Mobility is scan-derived, so recompute it here; the
+                        // stock arm keeps the stored `dda_precursor.im()`.
+                        let mob = converters.im.convert(dda_precursor.scan_index());
+                        precursor.inverse_ion_mobility = Some(f64::from(mob) as f32);
+                        let width = f64::from(dda_spectrum.isolation_window().width()) as f32;
+                        precursor.isolation_window =
+                            Option::from(Tolerance::Da(-width / 2.0, width / 2.0));
+                        let spectrum: RawSpectrum = RawSpectrum {
+                            file_id,
+                            precursors: vec![precursor],
+                            representation: Representation::Centroid,
+                            scan_start_time: f64::from(dda_precursor.rt()) as f32 / 60.0,
+                            ion_injection_time: f64::from(dda_precursor.rt()) as f32,
+                            total_ion_current: 0.0,
+                            mz: dda_spectrum
+                                .mz_values(converters.mz)
+                                .iter()
+                                .map(|&x| f64::from(x) as f32)
+                                .collect(),
+                            ms_level: 2,
+                            id: dda_spectrum.index().to_string(),
+                            intensity: dda_spectrum
+                                .intensities()
+                                .iter()
+                                .map(|&x| x as f32)
+                                .collect(),
+                            mobility: None,
+                        };
+                        Some(spectrum)
+                    }
+                    None => None,
+                },
+                Err(_) => None,
             })
             .collect();
         Ok(spectra)
