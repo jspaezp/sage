@@ -706,4 +706,91 @@ mod test {
         );
         Ok(())
     }
+
+    // Exercises referenceableParamGroup handling (issue #232):
+    // - `ms level`/centroid pulled from a spectrum-scope ref group
+    // - a <scanWindow> ref group (scan-range limits) that sage ignores
+    // - an inline isolation (quad) window that the scan-window ref must not disturb
+    #[tokio::test]
+    async fn parse_referenceable_param_group_issue_232() -> Result<(), MzMLError> {
+        let s = r#"
+        <mzML>
+        <referenceableParamGroupList count="2">
+            <referenceableParamGroup id="SpectrumParams">
+            <cvParam cvRef="MS" accession="MS:1000580" name="MSn spectrum" />
+            <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2" />
+            <cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum" />
+            </referenceableParamGroup>
+            <referenceableParamGroup id="ScanWindowParams">
+            <cvParam cvRef="MS" accession="MS:1000501" name="scan window lower limit" unitAccession="MS:1000040" unitCvRef="MS" unitName="m/z" value="140" />
+            <cvParam cvRef="MS" accession="MS:1000500" name="scan window upper limit" unitAccession="MS:1000040" unitCvRef="MS" unitName="m/z" value="1750" />
+            </referenceableParamGroup>
+        </referenceableParamGroupList>
+        <run>
+            <spectrumList count="1">
+            <spectrum id="dia=1" index="0" defaultArrayLength="3">
+                <referenceableParamGroupRef ref="SpectrumParams" />
+                <cvParam cvRef="MS" accession="MS:1000285" name="total ion current" value="100.0" />
+                <scanList count="1">
+                <scan>
+                    <cvParam cvRef="MS" accession="MS:1000016" name="scan start time" unitAccession="UO:0000031" unitCvRef="MS" unitName="minute" value="1.5" />
+                    <scanWindowList count="1">
+                    <scanWindow>
+                        <referenceableParamGroupRef ref="ScanWindowParams" />
+                    </scanWindow>
+                    </scanWindowList>
+                </scan>
+                </scanList>
+                <precursorList count="1">
+                <precursor>
+                    <isolationWindow>
+                        <cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" unitAccession="MS:1000040" unitCvRef="MS" unitName="m/z" value="404.5" />
+                        <cvParam cvRef="MS" accession="MS:1000828" name="isolation window lower offset" unitAccession="MS:1000040" unitCvRef="MS" unitName="m/z" value="5" />
+                        <cvParam cvRef="MS" accession="MS:1000829" name="isolation window upper offset" unitAccession="MS:1000040" unitCvRef="MS" unitName="m/z" value="5" />
+                    </isolationWindow>
+                    <selectedIonList count="1">
+                        <selectedIon>
+                        <cvParam cvRef="MS" accession="MS:1000744" name="selected ion m/z" unitAccession="MS:1000040" unitCvRef="MS" unitName="m/z" value="404.5" />
+                        </selectedIon>
+                    </selectedIonList>
+                </precursor>
+                </precursorList>
+                <binaryDataArrayList count="2">
+                <binaryDataArray encodedLength="16">
+                    <cvParam cvRef="MS" accession="MS:1000514" name="m/z array" unitCvRef="MS" unitAccession="MS:1000040" unitName="m/z" />
+                    <cvParam cvRef="MS" accession="MS:1000523" name="64-bit float" />
+                    <cvParam cvRef="MS" accession="MS:1000576" name="no compression" />
+                    <binary>AAAAAAAALkAAAAAAAAA0QAAAAAAAADlA</binary>
+                </binaryDataArray>
+                <binaryDataArray encodedLength="16">
+                    <cvParam cvRef="MS" accession="MS:1000515" name="intensity array" unitCvRef="MS" unitAccession="MS:1000131" unitName="number of detector counts" />
+                    <cvParam cvRef="MS" accession="MS:1000523" name="64-bit float" />
+                    <cvParam cvRef="MS" accession="MS:1000576" name="no compression" />
+                    <binary>AAAAAAAAWUAAAAAAAABZQAAAAAAAAFlA</binary>
+                </binaryDataArray>
+                </binaryDataArrayList>
+            </spectrum>
+            </spectrumList>
+        </run>
+        </mzML>
+        "#;
+
+        let mut spectra = MzMLReader::with_file_id(0).parse(s.as_bytes()).await?;
+        assert_eq!(spectra.len(), 1);
+        let s = spectra.pop().unwrap();
+
+        assert_eq!(s.id, "dia=1");
+        assert_eq!(s.ms_level, 2, "ms level from spectrum ref group");
+        assert_eq!(s.representation, Representation::Centroid);
+        assert_eq!(s.mz.len(), 3);
+        assert_eq!(s.intensity.len(), 3);
+        assert_eq!(s.precursors.len(), 1);
+        assert!((s.precursors[0].mz - 404.5).abs() < 1e-4);
+        assert_eq!(
+            s.precursors[0].isolation_window,
+            Some(Tolerance::Da(-5.0, 5.0)),
+            "inline isolation window must survive the scanWindow ref group"
+        );
+        Ok(())
+    }
 }
