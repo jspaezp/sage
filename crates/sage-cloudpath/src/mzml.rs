@@ -1,5 +1,5 @@
 use async_compression::tokio::bufread::ZlibDecoder;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Reader;
 use sage_core::spectrum::{Precursor, Representation};
 use sage_core::{mass::Tolerance, spectrum::RawSpectrum};
@@ -114,377 +114,16 @@ impl MzMLReader {
         let mut reader = Reader::from_reader(b);
         let mut buf = Vec::new();
 
-        let mut state = None;
-        let mut compression = false;
         let mut output_buffer = Vec::with_capacity(4096);
-        let mut binary_dtype = Dtype::F64;
-        let mut binary_array = None;
 
-        let mut spectrum = RawSpectrum::default_with_file_id(self.file_id);
-        let mut precursor = Precursor::default();
-        let mut iso_window_lo: Option<f32> = None;
-        let mut iso_window_hi: Option<f32> = None;
-        let mut spectra = Vec::new();
-
-        let mut noise_array = Vec::new();
-
-        // mzML allows shared cvParams to be defined once in a
-        // <referenceableParamGroup> and pulled into a spectrum (or other
-        // element) via <referenceableParamGroupRef ref="..."/>. Collect the
-        // group definitions here, then replay them wherever they're referenced.
-        let mut ref_params: HashMap<String, Vec<(Vec<u8>, Option<String>)>> = HashMap::new();
-        let mut current_ref_group: Option<String> = None;
-
-        macro_rules! extract {
-            ($ev:expr, $key:expr) => {
-                $ev.try_get_attribute($key)?
-                    .ok_or(MzMLError::Malformed)?
-                    .value
-            };
-        }
-
-        macro_rules! extract_value {
-            ($ev:expr) => {{
-                let s = $ev
-                    .try_get_attribute(b"value")?
-                    .ok_or(MzMLError::Malformed)?
-                    .value;
-                std::str::from_utf8(&s)?.parse()?
-            }};
-        }
-
-        // Apply a single cvParam pulled from a referenceableParamGroup as if it
-        // had appeared inline under the current `state`. Only spectrum/binaryDataArray
-        // params are handled; precursor/scan-scope group params (isolation window,
-        // charge, mobility) are dropped - spec-legal but unseen in real converters.
-        macro_rules! apply_ref_param {
-            ($acc:expr, $val:expr) => {{
-                let acc: &[u8] = $acc;
-                let val: Option<&str> = $val;
-                match state {
-                    Some(State::BinaryDataArray) => match acc {
-                        ZLIB_COMPRESSION => compression = true,
-                        NO_COMPRESSION => compression = false,
-                        FLOAT_64 => binary_dtype = Dtype::F64,
-                        FLOAT_32 => binary_dtype = Dtype::F32,
-                        INTENSITY_ARRAY => binary_array = Some(BinaryKind::Intensity),
-                        MZ_ARRAY => binary_array = Some(BinaryKind::Mz),
-                        NOISE_ARRAY => binary_array = Some(BinaryKind::Noise),
-                        _ => {}
-                    },
-                    Some(State::Spectrum) => match acc {
-                        MS_LEVEL => {
-                            let level = val.ok_or(MzMLError::Malformed)?.parse()?;
-                            if let Some(filter) = self.ms_level {
-                                if level != filter {
-                                    spectrum = RawSpectrum::default_with_file_id(self.file_id);
-                                    state = None;
-                                }
-                            }
-                            spectrum.ms_level = level;
-                        }
-                        PROFILE => spectrum.representation = Representation::Profile,
-                        CENTROID => spectrum.representation = Representation::Centroid,
-                        TOTAL_ION_CURRENT => {
-                            let value: f32 = val.ok_or(MzMLError::Malformed)?.parse()?;
-                            if value == 0.0 {
-                                spectrum = RawSpectrum::default_with_file_id(self.file_id);
-                                state = None;
-                            } else {
-                                spectrum.total_ion_current = value;
-                            }
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                }
-            }};
-        }
+        let mut parser = ParseState::new(self.file_id, self.ms_level, self.signal_to_noise);
 
         loop {
             match reader.read_event_into_async(&mut buf).await {
-                Ok(Event::Start(ref ev)) => {
-                    // State transition into child tag
-                    state = match (ev.name().into_inner(), state) {
-                        (b"spectrum", _) => Some(State::Spectrum),
-                        (b"scan", Some(State::Spectrum)) => Some(State::Scan),
-                        (b"binaryDataArray", Some(State::Spectrum)) => Some(State::BinaryDataArray),
-                        (b"binary", Some(State::BinaryDataArray)) => Some(State::Binary),
-                        (b"precursor", Some(State::Spectrum)) => Some(State::Precursor),
-                        (b"selectedIon", Some(State::Precursor)) => Some(State::SelectedIon),
-                        _ => state,
-                    };
-                    match ev.name().into_inner() {
-                        b"spectrum" => {
-                            let id = extract!(ev, b"id");
-                            let id = std::str::from_utf8(&id)?;
-                            spectrum.id = id.to_string();
-                        }
-                        b"precursor" => {
-                            // Not all precursor fields have a spectrumRef
-                            if let Some(scan) = ev.try_get_attribute(b"spectrumRef")? {
-                                let scan = std::str::from_utf8(&scan.value)?;
-                                precursor.spectrum_ref = Some(scan.to_string())
-                            }
-                        }
-                        b"referenceableParamGroup" => {
-                            let id = extract!(ev, b"id");
-                            let id = std::str::from_utf8(&id)?.to_string();
-                            ref_params.entry(id.clone()).or_default();
-                            current_ref_group = Some(id);
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(Event::Empty(ref ev)) => {
-                    // While inside a <referenceableParamGroup> definition, stash
-                    // each cvParam so it can be replayed at reference sites.
-                    if let Some(group) = &current_ref_group {
-                        if ev.name().into_inner() == b"cvParam" {
-                            let accession = extract!(ev, b"accession").into_owned();
-                            let value = match ev.try_get_attribute(b"value")? {
-                                Some(a) => Some(std::str::from_utf8(&a.value)?.to_string()),
-                                None => None,
-                            };
-                            if let Some(params) = ref_params.get_mut(group) {
-                                params.push((accession, value));
-                            }
-                            buf.clear();
-                            continue;
-                        }
-                    }
-                    match (state, ev.name().into_inner()) {
-                        (_, b"referenceableParamGroupRef") => {
-                            let id = extract!(ev, b"ref");
-                            let id = std::str::from_utf8(&id)?.to_string();
-                            if let Some(params) = ref_params.get(&id) {
-                                for (accession, value) in params.clone() {
-                                    apply_ref_param!(accession.as_slice(), value.as_deref());
-                                }
-                            }
-                        }
-                        (Some(State::BinaryDataArray), b"cvParam") => {
-                            let accession = extract!(ev, b"accession");
-                            match accession.as_ref() {
-                                ZLIB_COMPRESSION => compression = true,
-                                NO_COMPRESSION => compression = false,
-                                FLOAT_64 => binary_dtype = Dtype::F64,
-                                FLOAT_32 => binary_dtype = Dtype::F32,
-                                INTENSITY_ARRAY => binary_array = Some(BinaryKind::Intensity),
-                                MZ_ARRAY => binary_array = Some(BinaryKind::Mz),
-                                NOISE_ARRAY => binary_array = Some(BinaryKind::Noise),
-                                _ => {
-                                    // Unknown CV - perhaps noise
-                                    binary_array = None;
-                                }
-                            }
-                        }
-                        (Some(State::Spectrum), b"cvParam") => {
-                            let accession = extract!(ev, b"accession");
-                            match accession.as_ref() {
-                                MS_LEVEL => {
-                                    let level = extract_value!(ev);
-                                    if let Some(filter) = self.ms_level {
-                                        if level != filter {
-                                            spectrum =
-                                                RawSpectrum::default_with_file_id(self.file_id);
-                                            state = None;
-                                        }
-                                    }
-                                    spectrum.ms_level = level;
-                                }
-                                PROFILE => spectrum.representation = Representation::Profile,
-                                CENTROID => spectrum.representation = Representation::Centroid,
-                                TOTAL_ION_CURRENT => {
-                                    let value = extract_value!(ev);
-                                    if value == 0.0 {
-                                        // No ion current, break out of current state
-                                        spectrum = RawSpectrum::default_with_file_id(self.file_id);
-                                        state = None;
-                                    } else {
-                                        spectrum.total_ion_current = value;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        (Some(State::Precursor), b"cvParam") => {
-                            let accession = extract!(ev, b"accession");
-                            match accession.as_ref() {
-                                ISO_WINDOW_TARGET => {
-                                    // use isolation window target for precursor m/z, e.g. to handle
-                                    // DIA setups where the mzML conversion software doesn't write
-                                    // a selection ion tag
-                                    if precursor.mz == 0.0 {
-                                        precursor.mz = extract_value!(ev)
-                                    }
-                                }
-                                ISO_WINDOW_LOWER => iso_window_lo = Some(extract_value!(ev)),
-                                ISO_WINDOW_UPPER => iso_window_hi = Some(extract_value!(ev)),
-                                _ => {}
-                            }
-                        }
-                        (Some(State::SelectedIon), b"cvParam") => {
-                            let accession = extract!(ev, b"accession");
-                            match accession.as_ref() {
-                                SELECTED_ION_CHARGE => {
-                                    precursor.charge = Some(extract_value!(ev));
-                                }
-                                SELECTED_ION_MZ => {
-                                    let val = extract_value!(ev);
-                                    if val != 0.0 {
-                                        precursor.mz = val;
-                                    }
-                                }
-                                SELECTED_ION_INT => {
-                                    precursor.intensity = Some(extract_value!(ev));
-                                }
-                                INVERSE_ION_MOBILITY => {
-                                    precursor.inverse_ion_mobility = Some(extract_value!(ev));
-                                }
-                                _ => {}
-                            }
-                        }
-                        (Some(State::Scan), b"cvParam") => {
-                            let accession = extract!(ev, b"accession");
-                            match accession.as_ref() {
-                                SCAN_START_TIME => {
-                                    let scan_start_time = extract_value!(ev);
-                                    let unit = extract!(ev, b"unitAccession");
-
-                                    spectrum.scan_start_time = match unit.as_ref() {
-                                        UNIT_SECONDS => scan_start_time / 60.0,
-                                        UNIT_MINUTES => scan_start_time,
-                                        _ => return Err(MzMLError::Malformed),
-                                    };
-                                }
-                                ION_INJECTION_TIME => {
-                                    spectrum.ion_injection_time = extract_value!(ev);
-                                }
-                                INVERSE_ION_MOBILITY => {
-                                    precursor.inverse_ion_mobility = Some(extract_value!(ev));
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        _ => {}
-                    }
-                }
-                Ok(Event::Text(text)) => {
-                    if let Some(State::Binary) = state {
-                        if let Some(filter) = self.ms_level {
-                            if spectrum.ms_level != filter {
-                                continue;
-                            }
-                        }
-                        let raw = text.unescape()?;
-                        // There are occasionally empty binary data arrays, or unknown CVs
-                        if raw.is_empty() || binary_array.is_none() {
-                            continue;
-                        }
-                        let decoded = base64::decode(raw.as_bytes())?;
-                        let bytes = match compression {
-                            false => &decoded,
-                            true => {
-                                let mut r = ZlibDecoder::new(decoded.as_slice());
-                                let n = r.read_to_end(&mut output_buffer).await?;
-                                &output_buffer[..n]
-                            }
-                        };
-
-                        let array = match binary_dtype {
-                            Dtype::F32 => {
-                                let mut buf: [u8; 4] = [0; 4];
-                                bytes
-                                    .chunks(4)
-                                    .filter(|chunk| chunk.len() == 4)
-                                    .map(|chunk| {
-                                        buf.copy_from_slice(chunk);
-                                        f32::from_le_bytes(buf)
-                                    })
-                                    .collect::<Vec<f32>>()
-                            }
-                            Dtype::F64 => {
-                                let mut buf: [u8; 8] = [0; 8];
-                                bytes
-                                    .chunks(8)
-                                    .map(|chunk| {
-                                        buf.copy_from_slice(chunk);
-                                        f64::from_le_bytes(buf) as f32
-                                    })
-                                    .collect::<Vec<f32>>()
-                            }
-                        };
-                        output_buffer.clear();
-
-                        match binary_array {
-                            Some(BinaryKind::Intensity) => {
-                                spectrum.intensity = array;
-                            }
-                            Some(BinaryKind::Mz) => {
-                                spectrum.mz = array;
-                            }
-                            Some(BinaryKind::Noise) => {
-                                noise_array = array;
-                            }
-                            None => {}
-                        }
-
-                        binary_array = None;
-                    }
-                }
-                Ok(Event::End(ev)) => {
-                    state = match (state, ev.name().into_inner()) {
-                        (Some(State::Binary), b"binary") => Some(State::BinaryDataArray),
-                        (Some(State::BinaryDataArray), b"binaryDataArray") => Some(State::Spectrum),
-                        (Some(State::SelectedIon), b"selectedIon") => Some(State::Precursor),
-                        (Some(State::Precursor), b"precursor") => {
-                            if precursor.mz != 0.0 {
-                                precursor.isolation_window = match (iso_window_lo, iso_window_hi) {
-                                    (Some(lo), Some(hi)) => Some(Tolerance::Da(-lo, hi)),
-                                    _ => None,
-                                };
-                                spectrum.precursors.push(precursor);
-                                precursor = Precursor::default();
-                            }
-                            Some(State::Spectrum)
-                        }
-                        (Some(State::Scan), b"scan") => Some(State::Spectrum),
-                        (_, b"referenceableParamGroup") => {
-                            current_ref_group = None;
-                            state
-                        }
-                        (_, b"spectrum") => {
-                            let allow = self
-                                .ms_level
-                                .as_ref()
-                                .map(|&level| level == spectrum.ms_level)
-                                .unwrap_or(true);
-
-                            match (allow, self.signal_to_noise) {
-                                (true, Some(level))
-                                    if level == spectrum.ms_level && !noise_array.is_empty() =>
-                                {
-                                    spectrum
-                                        .intensity
-                                        .iter_mut()
-                                        .zip(noise_array.iter())
-                                        .for_each(|(int, noise)| *int /= noise);
-                                    noise_array.clear();
-                                    spectra.push(spectrum);
-                                }
-                                (true, _) => {
-                                    spectra.push(spectrum);
-                                }
-                                (false, _) => {}
-                            }
-                            spectrum = RawSpectrum::default_with_file_id(self.file_id);
-                            None
-                        }
-                        _ => state,
-                    };
-                }
+                Ok(Event::Start(ref ev)) => parser.on_start(ev)?,
+                Ok(Event::Empty(ref ev)) => parser.on_empty(ev)?,
+                Ok(Event::Text(text)) => parser.on_binary(&text, &mut output_buffer).await?,
+                Ok(Event::End(ref ev)) => parser.on_end(ev)?,
                 Ok(Event::Eof) => break,
                 Ok(_) => {}
                 Err(err) => {
@@ -493,7 +132,413 @@ impl MzMLReader {
             }
             buf.clear();
         }
-        Ok(spectra)
+        Ok(parser.spectra)
+    }
+}
+
+/// A required attribute, or [`MzMLError::Malformed`].
+fn get_attr<'a>(ev: &'a BytesStart, key: &[u8]) -> Result<std::borrow::Cow<'a, [u8]>, MzMLError> {
+    Ok(ev
+        .try_get_attribute(key)?
+        .ok_or(MzMLError::Malformed)?
+        .value)
+}
+
+/// Parse a required attribute into `T`.
+fn parse_attr<T>(ev: &BytesStart, key: &[u8]) -> Result<T, MzMLError>
+where
+    T: std::str::FromStr,
+    MzMLError: From<<T as std::str::FromStr>::Err>,
+{
+    let v = get_attr(ev, key)?;
+    Ok(std::str::from_utf8(&v)?.parse()?)
+}
+
+/// A cvParam resolved from its accession (the spectrum/binaryDataArray-level
+/// params - all a `<referenceableParamGroup>` carries in practice).
+#[derive(Copy, Clone)]
+enum Param {
+    MsLevel(u8),
+    Centroid,
+    Profile,
+    TotalIonCurrent(f32),
+    Compression(bool),
+    Dtype(Dtype),
+    ArrayKind(BinaryKind),
+    Ignored,
+}
+
+/// Resolve accession + value into a [`Param`]; parsing here surfaces group value
+/// errors at definition time.
+///
+/// Precursor/selectedIon/scan params (isolation window, charge, mobility) resolve
+/// to [`Param::Ignored`]: mzML allows groups in those scopes, but no converter
+/// we've seen uses them (ProteoWizard/SCIEX emit those inline).
+fn resolve(acc: &[u8], value: Option<&str>) -> Result<Param, MzMLError> {
+    Ok(match acc {
+        MS_LEVEL => Param::MsLevel(value.ok_or(MzMLError::Malformed)?.parse()?),
+        CENTROID => Param::Centroid,
+        PROFILE => Param::Profile,
+        TOTAL_ION_CURRENT => Param::TotalIonCurrent(value.ok_or(MzMLError::Malformed)?.parse()?),
+        ZLIB_COMPRESSION => Param::Compression(true),
+        NO_COMPRESSION => Param::Compression(false),
+        FLOAT_64 => Param::Dtype(Dtype::F64),
+        FLOAT_32 => Param::Dtype(Dtype::F32),
+        INTENSITY_ARRAY => Param::ArrayKind(BinaryKind::Intensity),
+        MZ_ARRAY => Param::ArrayKind(BinaryKind::Mz),
+        NOISE_ARRAY => Param::ArrayKind(BinaryKind::Noise),
+        _ => Param::Ignored,
+    })
+}
+
+/// Resolve a cvParam event into a [`Param`].
+fn resolve_param(ev: &BytesStart) -> Result<Param, MzMLError> {
+    let acc = get_attr(ev, b"accession")?;
+    let value = ev.try_get_attribute(b"value")?;
+    let value = match &value {
+        Some(a) => Some(std::str::from_utf8(&a.value)?),
+        None => None,
+    };
+    resolve(acc.as_ref(), value)
+}
+
+/// Parser state, lifted out of the event loop into per-event methods.
+///
+/// Holds no reader/buffers: an [`Event`] borrows the read buffer, so keeping it
+/// in the pump lets these methods take `&mut self`. Config is copied in - no
+/// lifetime parameter.
+struct ParseState {
+    file_id: usize,
+    ms_level: Option<u8>,
+    signal_to_noise: Option<u8>,
+
+    state: Option<State>,
+    spectrum: RawSpectrum,
+    precursor: Precursor,
+    iso_window_lo: Option<f32>,
+    iso_window_hi: Option<f32>,
+    noise_array: Vec<f32>,
+    compression: bool,
+    binary_dtype: Dtype,
+    binary_array: Option<BinaryKind>,
+
+    // cvParams shared via <referenceableParamGroup> and pulled in by
+    // <referenceableParamGroupRef>; resolved once, replayed through `apply`.
+    ref_params: HashMap<String, Vec<Param>>,
+    current_ref_group: Option<String>,
+
+    spectra: Vec<RawSpectrum>,
+}
+
+impl ParseState {
+    fn new(file_id: usize, ms_level: Option<u8>, signal_to_noise: Option<u8>) -> Self {
+        Self {
+            file_id,
+            ms_level,
+            signal_to_noise,
+            state: None,
+            spectrum: RawSpectrum::default_with_file_id(file_id),
+            precursor: Precursor::default(),
+            iso_window_lo: None,
+            iso_window_hi: None,
+            noise_array: Vec::new(),
+            compression: false,
+            binary_dtype: Dtype::F64,
+            binary_array: None,
+            ref_params: HashMap::new(),
+            current_ref_group: None,
+            spectra: Vec::new(),
+        }
+    }
+
+    /// Apply a resolved cvParam under the current state - the single path shared
+    /// by inline cvParams and replayed group params.
+    fn apply(&mut self, param: Param) {
+        match (self.state, param) {
+            (Some(State::Spectrum), Param::MsLevel(level)) => {
+                if let Some(filter) = self.ms_level {
+                    if level != filter {
+                        self.spectrum = RawSpectrum::default_with_file_id(self.file_id);
+                        self.state = None;
+                    }
+                }
+                self.spectrum.ms_level = level;
+            }
+            (Some(State::Spectrum), Param::Profile) => {
+                self.spectrum.representation = Representation::Profile
+            }
+            (Some(State::Spectrum), Param::Centroid) => {
+                self.spectrum.representation = Representation::Centroid
+            }
+            (Some(State::Spectrum), Param::TotalIonCurrent(value)) => {
+                if value == 0.0 {
+                    // No ion current, break out of current state
+                    self.spectrum = RawSpectrum::default_with_file_id(self.file_id);
+                    self.state = None;
+                } else {
+                    self.spectrum.total_ion_current = value;
+                }
+            }
+            (Some(State::BinaryDataArray), Param::Compression(c)) => self.compression = c,
+            (Some(State::BinaryDataArray), Param::Dtype(d)) => self.binary_dtype = d,
+            (Some(State::BinaryDataArray), Param::ArrayKind(k)) => self.binary_array = Some(k),
+            // Unknown CV inside a binary array - perhaps noise
+            (Some(State::BinaryDataArray), _) => self.binary_array = None,
+            _ => {}
+        }
+    }
+
+    fn on_start(&mut self, ev: &BytesStart) -> Result<(), MzMLError> {
+        // State transition into child tag
+        self.state = match (ev.name().into_inner(), self.state) {
+            (b"spectrum", _) => Some(State::Spectrum),
+            (b"scan", Some(State::Spectrum)) => Some(State::Scan),
+            (b"binaryDataArray", Some(State::Spectrum)) => Some(State::BinaryDataArray),
+            (b"binary", Some(State::BinaryDataArray)) => Some(State::Binary),
+            (b"precursor", Some(State::Spectrum)) => Some(State::Precursor),
+            (b"selectedIon", Some(State::Precursor)) => Some(State::SelectedIon),
+            _ => self.state,
+        };
+        match ev.name().into_inner() {
+            b"spectrum" => {
+                let id = get_attr(ev, b"id")?;
+                self.spectrum.id = std::str::from_utf8(&id)?.to_string();
+            }
+            b"precursor" => {
+                // Not all precursor fields have a spectrumRef
+                if let Some(scan) = ev.try_get_attribute(b"spectrumRef")? {
+                    let scan = std::str::from_utf8(&scan.value)?;
+                    self.precursor.spectrum_ref = Some(scan.to_string())
+                }
+            }
+            b"referenceableParamGroup" => {
+                let id = get_attr(ev, b"id")?;
+                let id = std::str::from_utf8(&id)?.to_string();
+                self.ref_params.entry(id.clone()).or_default();
+                self.current_ref_group = Some(id);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn on_empty(&mut self, ev: &BytesStart) -> Result<(), MzMLError> {
+        // Inside a group definition: stash resolved params for later replay.
+        if let Some(group) = &self.current_ref_group {
+            if ev.name().into_inner() == b"cvParam" {
+                let param = resolve_param(ev)?;
+                if let Some(params) = self.ref_params.get_mut(group) {
+                    params.push(param);
+                }
+                return Ok(());
+            }
+        }
+        match (self.state, ev.name().into_inner()) {
+            (_, b"referenceableParamGroupRef") => {
+                let id = get_attr(ev, b"ref")?;
+                let id = std::str::from_utf8(&id)?.to_string();
+                // Clone: release the &ref_params borrow before apply takes &mut self.
+                if let Some(params) = self.ref_params.get(&id).cloned() {
+                    for param in params {
+                        self.apply(param);
+                    }
+                }
+            }
+            (Some(State::Spectrum), b"cvParam") | (Some(State::BinaryDataArray), b"cvParam") => {
+                let param = resolve_param(ev)?;
+                self.apply(param);
+            }
+            (Some(State::Precursor), b"cvParam") => {
+                let accession = get_attr(ev, b"accession")?;
+                match accession.as_ref() {
+                    ISO_WINDOW_TARGET => {
+                        // use isolation window target for precursor m/z, e.g. to handle
+                        // DIA setups where the mzML conversion software doesn't write
+                        // a selection ion tag
+                        if self.precursor.mz == 0.0 {
+                            self.precursor.mz = parse_attr(ev, b"value")?
+                        }
+                    }
+                    ISO_WINDOW_LOWER => self.iso_window_lo = Some(parse_attr(ev, b"value")?),
+                    ISO_WINDOW_UPPER => self.iso_window_hi = Some(parse_attr(ev, b"value")?),
+                    _ => {}
+                }
+            }
+            (Some(State::SelectedIon), b"cvParam") => {
+                let accession = get_attr(ev, b"accession")?;
+                match accession.as_ref() {
+                    SELECTED_ION_CHARGE => {
+                        self.precursor.charge = Some(parse_attr(ev, b"value")?);
+                    }
+                    SELECTED_ION_MZ => {
+                        let val = parse_attr(ev, b"value")?;
+                        if val != 0.0 {
+                            self.precursor.mz = val;
+                        }
+                    }
+                    SELECTED_ION_INT => {
+                        self.precursor.intensity = Some(parse_attr(ev, b"value")?);
+                    }
+                    INVERSE_ION_MOBILITY => {
+                        self.precursor.inverse_ion_mobility = Some(parse_attr(ev, b"value")?);
+                    }
+                    _ => {}
+                }
+            }
+            (Some(State::Scan), b"cvParam") => {
+                let accession = get_attr(ev, b"accession")?;
+                match accession.as_ref() {
+                    SCAN_START_TIME => {
+                        let scan_start_time: f32 = parse_attr(ev, b"value")?;
+                        let unit = get_attr(ev, b"unitAccession")?;
+
+                        self.spectrum.scan_start_time = match unit.as_ref() {
+                            UNIT_SECONDS => scan_start_time / 60.0,
+                            UNIT_MINUTES => scan_start_time,
+                            _ => return Err(MzMLError::Malformed),
+                        };
+                    }
+                    ION_INJECTION_TIME => {
+                        self.spectrum.ion_injection_time = parse_attr(ev, b"value")?;
+                    }
+                    INVERSE_ION_MOBILITY => {
+                        self.precursor.inverse_ion_mobility = Some(parse_attr(ev, b"value")?);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn on_binary(
+        &mut self,
+        text: &BytesText<'_>,
+        output_buffer: &mut Vec<u8>,
+    ) -> Result<(), MzMLError> {
+        if self.state != Some(State::Binary) {
+            return Ok(());
+        }
+        if let Some(filter) = self.ms_level {
+            if self.spectrum.ms_level != filter {
+                return Ok(());
+            }
+        }
+        let raw = text.unescape()?;
+        // There are occasionally empty binary data arrays, or unknown CVs
+        if raw.is_empty() || self.binary_array.is_none() {
+            return Ok(());
+        }
+        let decoded = base64::decode(raw.as_bytes())?;
+        let bytes = match self.compression {
+            false => &decoded,
+            true => {
+                let mut r = ZlibDecoder::new(decoded.as_slice());
+                let n = r.read_to_end(output_buffer).await?;
+                &output_buffer[..n]
+            }
+        };
+
+        let array = match self.binary_dtype {
+            Dtype::F32 => {
+                let mut buf: [u8; 4] = [0; 4];
+                bytes
+                    .chunks(4)
+                    .filter(|chunk| chunk.len() == 4)
+                    .map(|chunk| {
+                        buf.copy_from_slice(chunk);
+                        f32::from_le_bytes(buf)
+                    })
+                    .collect::<Vec<f32>>()
+            }
+            Dtype::F64 => {
+                let mut buf: [u8; 8] = [0; 8];
+                bytes
+                    .chunks(8)
+                    .map(|chunk| {
+                        buf.copy_from_slice(chunk);
+                        f64::from_le_bytes(buf) as f32
+                    })
+                    .collect::<Vec<f32>>()
+            }
+        };
+        output_buffer.clear();
+
+        match self.binary_array {
+            Some(BinaryKind::Intensity) => {
+                self.spectrum.intensity = array;
+            }
+            Some(BinaryKind::Mz) => {
+                self.spectrum.mz = array;
+            }
+            Some(BinaryKind::Noise) => {
+                self.noise_array = array;
+            }
+            None => {}
+        }
+
+        self.binary_array = None;
+        Ok(())
+    }
+
+    fn on_end(&mut self, ev: &BytesEnd) -> Result<(), MzMLError> {
+        self.state = match (self.state, ev.name().into_inner()) {
+            (Some(State::Binary), b"binary") => Some(State::BinaryDataArray),
+            (Some(State::BinaryDataArray), b"binaryDataArray") => Some(State::Spectrum),
+            (Some(State::SelectedIon), b"selectedIon") => Some(State::Precursor),
+            (Some(State::Precursor), b"precursor") => {
+                if self.precursor.mz != 0.0 {
+                    self.precursor.isolation_window = match (self.iso_window_lo, self.iso_window_hi)
+                    {
+                        (Some(lo), Some(hi)) => Some(Tolerance::Da(-lo, hi)),
+                        _ => None,
+                    };
+                    let precursor = std::mem::take(&mut self.precursor);
+                    self.spectrum.precursors.push(precursor);
+                }
+                Some(State::Spectrum)
+            }
+            (Some(State::Scan), b"scan") => Some(State::Spectrum),
+            (_, b"referenceableParamGroup") => {
+                self.current_ref_group = None;
+                self.state
+            }
+            (_, b"spectrum") => {
+                let allow = self
+                    .ms_level
+                    .as_ref()
+                    .map(|&level| level == self.spectrum.ms_level)
+                    .unwrap_or(true);
+
+                let keep = match (allow, self.signal_to_noise) {
+                    (true, Some(level))
+                        if level == self.spectrum.ms_level && !self.noise_array.is_empty() =>
+                    {
+                        self.spectrum
+                            .intensity
+                            .iter_mut()
+                            .zip(self.noise_array.iter())
+                            .for_each(|(int, noise)| *int /= noise);
+                        self.noise_array.clear();
+                        true
+                    }
+                    (true, _) => true,
+                    (false, _) => false,
+                };
+
+                let spectrum = std::mem::replace(
+                    &mut self.spectrum,
+                    RawSpectrum::default_with_file_id(self.file_id),
+                );
+                if keep {
+                    self.spectra.push(spectrum);
+                }
+                None
+            }
+            _ => self.state,
+        };
+        Ok(())
     }
 }
 
