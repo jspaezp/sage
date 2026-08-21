@@ -5,10 +5,45 @@ use sage_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, path::Path};
+use timsrust::core::AcquisitionType;
 use timsrust::core::{Converter, Frame, Im, MSLevel, Mz, ScanIndex, TofIndex};
-use timsrust::{ImConverter, SpectrumReader, TimsTofPath};
+use timsrust::tdf::{Metadata, TDFPath};
+use timsrust::{ImConverter, MzConverter, SpectrumReader, TimsTofPath};
 
 pub struct TdfReader;
+
+/// The dataset's stock TOF->m/z converter.
+fn require_mz_converter(
+    path: &TimsTofPath,
+) -> Result<MzConverter, timsrust::tdf::MetadataReaderError> {
+    path.mz_converter().ok_or_else(|| {
+        timsrust::tdf::MetadataReaderError::KeyNotFound(
+            "m/z calibration for this timsTOF dataset".to_string(),
+        )
+    })
+}
+
+/// The dataset's stock scan->1/K0 converter.
+fn require_im_converter(
+    path: &TimsTofPath,
+) -> Result<ImConverter, timsrust::tdf::MetadataReaderError> {
+    path.im_converter().ok_or_else(|| {
+        timsrust::tdf::MetadataReaderError::KeyNotFound(
+            "ion mobility calibration for this timsTOF dataset".to_string(),
+        )
+    })
+}
+
+/// True only for a Bruker DIA-PASEF `.d`; false for non-TDF formats and on any
+/// metadata error.
+fn is_diapasef(path_str: &str) -> bool {
+    let Ok(tdf_path) = TDFPath::new(path_str) else {
+        return false;
+    };
+    Metadata::new(&tdf_path)
+        .map(|m| m.acquisition_type() == AcquisitionType::DIAPASEF)
+        .unwrap_or(false)
+}
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy)]
 pub struct BrukerMS1CentoidingConfig {
@@ -25,14 +60,8 @@ impl Default for BrukerMS1CentoidingConfig {
     }
 }
 
-/// Plain, serializable mirror of [`timsrust::tdf::SpectrumProcessingParams`].
-///
-/// In timsrust 0.4.2, `SpectrumReaderConfig` was a concrete, directly
-/// serializable struct. As of 0.5.x it is generic over the IM converter
-/// (`SpectrumReaderConfig<ImC>`) and the upstream `SpectrumProcessingParams`
-/// itself carries no `serde` derives. This local copy holds only the plain
-/// parameters a user can actually configure, and is converted into the
-/// upstream type at `parse()` time (see `BrukerMS2ProcessingConfig::into_timsrust`).
+/// Serializable mirror of [`timsrust::tdf::SpectrumProcessingParams`], which
+/// carries no `serde` derives as of timsrust 0.5.
 #[derive(Deserialize, Serialize, Debug, Clone, Copy)]
 pub struct BrukerSpectrumProcessingParams {
     pub smoothing_window: u32,
@@ -64,83 +93,18 @@ impl From<BrukerSpectrumProcessingParams> for timsrust::tdf::SpectrumProcessingP
     }
 }
 
-/// Plain, serializable mirror of [`timsrust::tdf::QuadWindowExpansionStrategy`].
-///
-/// The upstream enum's `UniformMobility` variant carries an
-/// `Option<Arc<ImC>>` payload (the scan->IM converter used to sub-split
-/// windows in mobility space), which is neither serializable nor known until
-/// a dataset is opened. We drop that payload here and always pass `None` when
-/// converting back to the upstream type; timsrust fills it in automatically
-/// from the dataset's own IM converter inside
-/// `TDFSpectrumReader::new`/`FrameWindowSplittingConfiguration::finalize`.
-#[derive(Deserialize, Serialize, Debug, Clone, Copy)]
-pub enum BrukerQuadWindowExpansionStrategy {
-    None,
-    Even(usize),
-    UniformMobility(f64, f64),
-    UniformScan(usize, usize),
-}
-
-impl Default for BrukerQuadWindowExpansionStrategy {
-    fn default() -> Self {
-        Self::Even(1)
-    }
-}
-
-/// Plain, serializable mirror of [`timsrust::tdf::FrameWindowSplittingConfiguration`].
-#[derive(Deserialize, Serialize, Debug, Clone, Copy)]
-pub enum BrukerFrameSplittingConfig {
-    Quadrupole(BrukerQuadWindowExpansionStrategy),
-    Window(BrukerQuadWindowExpansionStrategy),
-}
-
-impl Default for BrukerFrameSplittingConfig {
-    fn default() -> Self {
-        Self::Quadrupole(BrukerQuadWindowExpansionStrategy::default())
-    }
-}
-
-fn convert_expansion_strategy(
-    s: BrukerQuadWindowExpansionStrategy,
-) -> timsrust::tdf::QuadWindowExpansionStrategy<ImConverter> {
-    use timsrust::tdf::QuadWindowExpansionStrategy as Q;
-    match s {
-        BrukerQuadWindowExpansionStrategy::None => Q::None,
-        BrukerQuadWindowExpansionStrategy::Even(n) => Q::Even(n),
-        BrukerQuadWindowExpansionStrategy::UniformMobility(span, step) => {
-            Q::UniformMobility((span, step), None)
-        }
-        BrukerQuadWindowExpansionStrategy::UniformScan(span, step) => Q::UniformScan((span, step)),
-    }
-}
-
-impl From<BrukerFrameSplittingConfig>
-    for timsrust::tdf::FrameWindowSplittingConfiguration<ImConverter>
-{
-    fn from(config: BrukerFrameSplittingConfig) -> Self {
-        use timsrust::tdf::FrameWindowSplittingConfiguration as F;
-        match config {
-            BrukerFrameSplittingConfig::Quadrupole(s) => {
-                F::Quadrupole(convert_expansion_strategy(s))
-            }
-            BrukerFrameSplittingConfig::Window(s) => F::Window(convert_expansion_strategy(s)),
-        }
-    }
-}
-
-/// Serializable mirror of `timsrust::tdf::SpectrumReaderConfig<ImConverter>`
-/// (the MS2/DDA spectrum reader configuration).
+/// DDA spectrum reader configuration. Frame splitting is not exposed: DDA does
+/// not use it and DIA-PASEF goes through timsrust's centroider.
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, Default)]
 pub struct BrukerMS2ProcessingConfig {
     pub spectrum_processing_params: BrukerSpectrumProcessingParams,
-    pub frame_splitting_params: BrukerFrameSplittingConfig,
 }
 
 impl BrukerMS2ProcessingConfig {
     fn into_timsrust(self) -> timsrust::tdf::SpectrumReaderConfig<ImConverter> {
         timsrust::tdf::SpectrumReaderConfig {
             spectrum_processing_params: self.spectrum_processing_params.into(),
-            frame_splitting_params: self.frame_splitting_params.into(),
+            frame_splitting_params: Default::default(),
         }
     }
 }
@@ -161,6 +125,18 @@ impl TdfReader {
     ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
         let path_str = path_name.as_ref().to_string_lossy().into_owned();
         let path = TimsTofPath::new(&path_str)?;
+
+        if is_diapasef(&path_str) {
+            log::warn!(
+                "{path_str}: DIA-PASEF read — timsrust centroider (precursor detection); \
+                 stock (uncalibrated) converters; MS2 processing params ignored"
+            );
+            let mut spectra = self.read_dia_ms2_timsrust(&path, file_id)?;
+            if requires_ms1 {
+                spectra.extend(self.read_ms1_spectra(&path, file_id, config.ms1)?);
+            }
+            return Ok(spectra);
+        }
 
         let spectrum_reader = SpectrumReader::build()
             .with_path(&path)
@@ -183,25 +159,16 @@ impl TdfReader {
     ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
         let start = std::time::Instant::now();
         let frame_reader = timsrust::tdf::TdfFrameReader::new(path)?;
-        let mz_converter = path.mz_converter().ok_or_else(|| {
-            timsrust::tdf::MetadataReaderError::KeyNotFound(
-                "m/z calibration for this timsTOF dataset".to_string(),
-            )
-        })?;
-        let ims_converter = path.im_converter().ok_or_else(|| {
-            timsrust::tdf::MetadataReaderError::KeyNotFound(
-                "ion mobility calibration for this timsTOF dataset".to_string(),
-            )
-        })?;
+        let mz_converter = require_mz_converter(path)?;
+        let ims_converter = require_im_converter(path)?;
         let tol_ppm = config.mz_ppm;
         let im_tol_pct = config.ims_pct;
 
         let indices: Vec<usize> = frame_reader.iter_indices().collect();
         let ms1_spectra: Vec<RawSpectrum> = indices
             .into_par_iter()
-            // Filter on ms_level using the cheap, ion-less partial frame
-            // before paying the cost of decompressing the full frame ions
-            // (mirrors the old `FrameReader::parallel_filter` behavior).
+            // Check ms_level on the ion-less partial frame, before paying to
+            // decompress the frame's ions.
             .filter_map(
                 |index| match frame_reader.get_partial_frame_without_ions(index) {
                     Ok(partial_frame) => {
@@ -316,6 +283,68 @@ impl TdfReader {
         precursor.inverse_ion_mobility = Option::from(f64::from(dda_precursor.im()) as f32);
         precursor
     }
+
+    /// DIA-PASEF MS2 via timsrust's centroider: it deisotopes each MS1 frame to
+    /// find precursors, then extracts a mobility-narrow MS2 spectrum per
+    /// detected precursor.
+    fn read_dia_ms2_timsrust(
+        &self,
+        path: &TimsTofPath,
+        file_id: usize,
+    ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
+        use timsrust::core::utils::reader::ParIterableReader as _;
+
+        let frame_reader = timsrust::tdf::TdfFrameReader::new(path)?.into_inner();
+        let mz_converter = require_mz_converter(path)?;
+        let ims_converter = require_im_converter(path)?;
+        // Args: min_ms1_ion_count, min_ms2_ion_count, min_spectrum_size, use_precursors.
+        let reader = timsrust::centroid::spectrum_reader::SpectrumReader::new(
+            frame_reader,
+            0.5,
+            2.0,
+            5,
+            true,
+            ims_converter,
+            mz_converter.clone(),
+        )
+        .map_err(|e| {
+            timsrust::tdf::FrameReaderError::FileNotFound(format!(
+                "timsrust DIA centroider init failed: {e}"
+            ))
+        })?;
+
+        let spectra: Vec<RawSpectrum> = reader
+            .par_iter()
+            .filter_map(|res| {
+                let spectrum = res.ok()?;
+                let dda_precursor = spectrum.precursor().as_ref()?;
+                let mut precursor = Self::parse_precursor(dda_precursor);
+                let width = f64::from(spectrum.isolation_window().width()) as f32;
+                precursor.isolation_window = Some(Tolerance::Da(-width / 2.0, width / 2.0));
+                let intensity: Vec<f32> =
+                    spectrum.intensities().iter().map(|&x| x as f32).collect();
+                let total_ion_current: f32 = intensity.iter().sum();
+                Some(RawSpectrum {
+                    file_id,
+                    precursors: vec![precursor],
+                    representation: Representation::Centroid,
+                    scan_start_time: f64::from(dda_precursor.rt()) as f32 / 60.0,
+                    ion_injection_time: f64::from(dda_precursor.rt()) as f32,
+                    total_ion_current,
+                    mz: spectrum
+                        .mz_values(mz_converter.clone())
+                        .iter()
+                        .map(|&x| f64::from(x) as f32)
+                        .collect(),
+                    ms_level: 2,
+                    id: spectrum.index().to_string(),
+                    intensity,
+                    mobility: None,
+                })
+            })
+            .collect();
+        Ok(spectra)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -344,9 +373,7 @@ impl PeakBuffer {
         }
     }
 
-    /// Generic over the converters (rather than the concrete `MzConverter`/
-    /// `ImConverter` enums) so that a future calibrated converter can be
-    /// dropped in with no further refactor here.
+    /// Generic over the converters so a calibrated converter can drop in.
     fn with_frame<M: Converter<TofIndex, Mz>, I: Converter<ScanIndex, Im>>(
         &mut self,
         frame: &Frame,
@@ -552,5 +579,22 @@ impl PeakBuffer {
             .drain(..)
             .map(|x| (x.mz, (x.intensity, x.im)))
             .unzip()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Configs written against the old `frame_splitting_params` knob must still load.
+    #[test]
+    fn ms2_config_ignores_legacy_frame_splitting_key() {
+        let cfg: BrukerMS2ProcessingConfig = serde_json::from_str(
+            r#"{"frame_splitting_params": {"Quadrupole": {"Even": 3}},
+                "spectrum_processing_params": {"smoothing_window": 3, "centroiding_window": 1,
+                                               "calibration_tolerance": 0.1, "calibrate": false}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.spectrum_processing_params.smoothing_window, 3);
     }
 }
