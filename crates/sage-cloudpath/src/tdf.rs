@@ -5,10 +5,45 @@ use sage_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, path::Path};
-use timsrust::converters::{ConvertableDomain, Scan2ImConverter, Tof2MzConverter};
-use timsrust::readers::SpectrumReader;
-use timsrust::readers::SpectrumReaderConfig as TimsrustSpectrumConfig;
+use timsrust::core::AcquisitionType;
+use timsrust::core::{Converter, Frame, Im, MSLevel, Mz, ScanIndex, TofIndex};
+use timsrust::tdf::{Metadata, TDFPath};
+use timsrust::{ImConverter, MzConverter, SpectrumReader, TimsTofPath};
+
 pub struct TdfReader;
+
+/// The dataset's stock TOF->m/z converter.
+fn require_mz_converter(
+    path: &TimsTofPath,
+) -> Result<MzConverter, timsrust::tdf::MetadataReaderError> {
+    path.mz_converter().ok_or_else(|| {
+        timsrust::tdf::MetadataReaderError::KeyNotFound(
+            "m/z calibration for this timsTOF dataset".to_string(),
+        )
+    })
+}
+
+/// The dataset's stock scan->1/K0 converter.
+fn require_im_converter(
+    path: &TimsTofPath,
+) -> Result<ImConverter, timsrust::tdf::MetadataReaderError> {
+    path.im_converter().ok_or_else(|| {
+        timsrust::tdf::MetadataReaderError::KeyNotFound(
+            "ion mobility calibration for this timsTOF dataset".to_string(),
+        )
+    })
+}
+
+/// True only for a Bruker DIA-PASEF `.d`; false for non-TDF formats and on any
+/// metadata error.
+fn is_diapasef(path_str: &str) -> bool {
+    let Ok(tdf_path) = TDFPath::new(path_str) else {
+        return false;
+    };
+    Metadata::new(&tdf_path)
+        .map(|m| m.acquisition_type() == AcquisitionType::DIAPASEF)
+        .unwrap_or(false)
+}
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy)]
 pub struct BrukerMS1CentoidingConfig {
@@ -25,9 +60,58 @@ impl Default for BrukerMS1CentoidingConfig {
     }
 }
 
+/// Serializable mirror of [`timsrust::tdf::SpectrumProcessingParams`], which
+/// carries no `serde` derives as of timsrust 0.5.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy)]
+pub struct BrukerSpectrumProcessingParams {
+    pub smoothing_window: u32,
+    pub centroiding_window: u32,
+    pub calibration_tolerance: f64,
+    pub calibrate: bool,
+}
+
+impl Default for BrukerSpectrumProcessingParams {
+    fn default() -> Self {
+        let defaults = timsrust::tdf::SpectrumProcessingParams::default();
+        Self {
+            smoothing_window: defaults.smoothing_window,
+            centroiding_window: defaults.centroiding_window,
+            calibration_tolerance: defaults.calibration_tolerance,
+            calibrate: defaults.calibrate,
+        }
+    }
+}
+
+impl From<BrukerSpectrumProcessingParams> for timsrust::tdf::SpectrumProcessingParams {
+    fn from(p: BrukerSpectrumProcessingParams) -> Self {
+        timsrust::tdf::SpectrumProcessingParams {
+            smoothing_window: p.smoothing_window,
+            centroiding_window: p.centroiding_window,
+            calibration_tolerance: p.calibration_tolerance,
+            calibrate: p.calibrate,
+        }
+    }
+}
+
+/// DDA spectrum reader configuration. Frame splitting is not exposed: DDA does
+/// not use it and DIA-PASEF goes through timsrust's centroider.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default)]
+pub struct BrukerMS2ProcessingConfig {
+    pub spectrum_processing_params: BrukerSpectrumProcessingParams,
+}
+
+impl BrukerMS2ProcessingConfig {
+    fn into_timsrust(self) -> timsrust::tdf::SpectrumReaderConfig<ImConverter> {
+        timsrust::tdf::SpectrumReaderConfig {
+            spectrum_processing_params: self.spectrum_processing_params.into(),
+            frame_splitting_params: Default::default(),
+        }
+    }
+}
+
 #[derive(Default, Deserialize, Serialize, Debug, Clone, Copy)]
 pub struct BrukerProcessingConfig {
-    pub ms2: TimsrustSpectrumConfig,
+    pub ms2: BrukerMS2ProcessingConfig,
     pub ms1: BrukerMS1CentoidingConfig,
 }
 
@@ -39,13 +123,28 @@ impl TdfReader {
         config: BrukerProcessingConfig,
         requires_ms1: bool,
     ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
-        let spectrum_reader = timsrust::readers::SpectrumReader::build()
-            .with_path(path_name.as_ref())
-            .with_config(config.ms2)
+        let path_str = path_name.as_ref().to_string_lossy().into_owned();
+        let path = TimsTofPath::new(&path_str)?;
+
+        if is_diapasef(&path_str) {
+            log::warn!(
+                "{path_str}: DIA-PASEF read — timsrust centroider (precursor detection); \
+                 stock (uncalibrated) converters; MS2 processing params ignored"
+            );
+            let mut spectra = self.read_dia_ms2_timsrust(&path, file_id)?;
+            if requires_ms1 {
+                spectra.extend(self.read_ms1_spectra(&path, file_id, config.ms1)?);
+            }
+            return Ok(spectra);
+        }
+
+        let spectrum_reader = SpectrumReader::build()
+            .with_path(&path)
+            .with_config(config.ms2.into_timsrust())
             .finalize()?;
         let mut spectra = self.read_msn_spectra(file_id, &spectrum_reader)?;
         if requires_ms1 {
-            let ms1s = self.read_ms1_spectra(&path_name, file_id, config.ms1)?;
+            let ms1s = self.read_ms1_spectra(&path, file_id, config.ms1)?;
             spectra.extend(ms1s);
         }
 
@@ -54,20 +153,34 @@ impl TdfReader {
 
     fn read_ms1_spectra(
         &self,
-        path_name: impl AsRef<Path>,
+        path: &TimsTofPath,
         file_id: usize,
         config: BrukerMS1CentoidingConfig,
     ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
         let start = std::time::Instant::now();
-        let frame_reader = timsrust::readers::FrameReader::new(path_name.as_ref())?;
-        let metadata = timsrust::readers::MetadataReader::new(path_name.as_ref())?;
-        let mz_converter = metadata.mz_converter;
-        let ims_converter = metadata.im_converter;
+        let frame_reader = timsrust::tdf::TdfFrameReader::new(path)?;
+        let mz_converter = require_mz_converter(path)?;
+        let ims_converter = require_im_converter(path)?;
         let tol_ppm = config.mz_ppm;
         let im_tol_pct = config.ims_pct;
 
-        let ms1_spectra: Vec<RawSpectrum> = frame_reader
-            .parallel_filter(|f| f.ms_level == timsrust::MSLevel::MS1)
+        let indices: Vec<usize> = frame_reader.iter_indices().collect();
+        let ms1_spectra: Vec<RawSpectrum> = indices
+            .into_par_iter()
+            // Check ms_level on the ion-less partial frame, before paying to
+            // decompress the frame's ions.
+            .filter_map(
+                |index| match frame_reader.get_partial_frame_without_ions(index) {
+                    Ok(partial_frame) => {
+                        if partial_frame.info().ms_level() == MSLevel::MS1 {
+                            Some(frame_reader.get_frame(index))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => Some(Err(e)),
+                },
+            )
             .map_init(
                 || PeakBuffer::with_capacity(2 * MAX_PEAKS),
                 |buffer, frame| match frame {
@@ -79,11 +192,11 @@ impl TdfReader {
                         let (mz, (intensity, mobility)): (Vec<f32>, (Vec<f32>, Vec<f32>)) =
                             buffer.fastcentroid_frame(tol_ppm, im_tol_pct);
 
-                        let scan_start_time = frame.rt_in_seconds as f32 / 60.0;
+                        let scan_start_time = frame.info().rt_in_seconds() as f32 / 60.0;
                         let ion_injection_time = 100.0; // This is made up, in theory we can read
                                                         // if from the tdf file
                         let total_ion_current = intensity.iter().sum::<f32>();
-                        let id = frame.index.to_string();
+                        let id = frame.info().index().to_string();
 
                         let spec = RawSpectrum {
                             file_id,
@@ -124,24 +237,31 @@ impl TdfReader {
         let spectra: Vec<RawSpectrum> = (0..spectrum_reader.len())
             .into_par_iter()
             .filter_map(|index| match spectrum_reader.get(index) {
-                Ok(dda_spectrum) => match dda_spectrum.precursor {
+                Ok(dda_spectrum) => match dda_spectrum.precursor() {
                     Some(dda_precursor) => {
                         let mut precursor = Self::parse_precursor(dda_precursor);
-                        precursor.isolation_window = Option::from(Tolerance::Da(
-                            -dda_spectrum.isolation_width as f32 / 2.0,
-                            dda_spectrum.isolation_width as f32 / 2.0,
-                        ));
+                        let width = f64::from(dda_spectrum.isolation_window().width()) as f32;
+                        precursor.isolation_window =
+                            Option::from(Tolerance::Da(-width / 2.0, width / 2.0));
                         let spectrum: RawSpectrum = RawSpectrum {
                             file_id,
                             precursors: vec![precursor],
                             representation: Representation::Centroid,
-                            scan_start_time: dda_precursor.rt as f32 / 60.0,
-                            ion_injection_time: dda_precursor.rt as f32,
+                            scan_start_time: f64::from(dda_precursor.rt()) as f32 / 60.0,
+                            ion_injection_time: f64::from(dda_precursor.rt()) as f32,
                             total_ion_current: 0.0,
-                            mz: dda_spectrum.mz_values.iter().map(|&x| x as f32).collect(),
+                            mz: dda_spectrum
+                                .mz_values()
+                                .iter()
+                                .map(|&x| f64::from(x) as f32)
+                                .collect(),
                             ms_level: 2,
-                            id: dda_spectrum.index.to_string(),
-                            intensity: dda_spectrum.intensities.iter().map(|&x| x as f32).collect(),
+                            id: dda_spectrum.index().to_string(),
+                            intensity: dda_spectrum
+                                .intensities()
+                                .iter()
+                                .map(|&x| x as f32)
+                                .collect(),
                             mobility: None,
                         };
                         Some(spectrum)
@@ -154,14 +274,76 @@ impl TdfReader {
         Ok(spectra)
     }
 
-    fn parse_precursor(dda_precursor: timsrust::Precursor) -> Precursor {
+    fn parse_precursor(dda_precursor: &timsrust::core::Precursor) -> Precursor {
         let mut precursor: Precursor = Precursor::default();
-        precursor.mz = dda_precursor.mz as f32;
-        precursor.charge = dda_precursor.charge.map(|x| x as u8);
-        precursor.intensity = dda_precursor.intensity.map(|x| x as f32);
-        precursor.spectrum_ref = Option::from(dda_precursor.frame_index.to_string());
-        precursor.inverse_ion_mobility = Option::from(dda_precursor.im as f32);
+        precursor.mz = f64::from(dda_precursor.mz()) as f32;
+        precursor.charge = dda_precursor.charge().map(|x| i8::from(x) as u8);
+        precursor.intensity = dda_precursor.intensity().map(|x| x as f32);
+        precursor.spectrum_ref = Option::from(dda_precursor.frame_index().to_string());
+        precursor.inverse_ion_mobility = Option::from(f64::from(dda_precursor.im()) as f32);
         precursor
+    }
+
+    /// DIA-PASEF MS2 via timsrust's centroider: it deisotopes each MS1 frame to
+    /// find precursors, then extracts a mobility-narrow MS2 spectrum per
+    /// detected precursor.
+    fn read_dia_ms2_timsrust(
+        &self,
+        path: &TimsTofPath,
+        file_id: usize,
+    ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
+        use timsrust::core::utils::reader::ParIterableReader as _;
+
+        let frame_reader = timsrust::tdf::TdfFrameReader::new(path)?.into_inner();
+        let mz_converter = require_mz_converter(path)?;
+        let ims_converter = require_im_converter(path)?;
+        // Args: min_ms1_ion_count, min_ms2_ion_count, min_spectrum_size, use_precursors.
+        let reader = timsrust::centroid::spectrum_reader::SpectrumReader::new(
+            frame_reader,
+            0.5,
+            2.0,
+            5,
+            true,
+            ims_converter,
+            mz_converter.clone(),
+        )
+        .map_err(|e| {
+            timsrust::tdf::FrameReaderError::FileNotFound(format!(
+                "timsrust DIA centroider init failed: {e}"
+            ))
+        })?;
+
+        let spectra: Vec<RawSpectrum> = reader
+            .par_iter()
+            .filter_map(|res| {
+                let spectrum = res.ok()?;
+                let dda_precursor = spectrum.precursor().as_ref()?;
+                let mut precursor = Self::parse_precursor(dda_precursor);
+                let width = f64::from(spectrum.isolation_window().width()) as f32;
+                precursor.isolation_window = Some(Tolerance::Da(-width / 2.0, width / 2.0));
+                let intensity: Vec<f32> =
+                    spectrum.intensities().iter().map(|&x| x as f32).collect();
+                let total_ion_current: f32 = intensity.iter().sum();
+                Some(RawSpectrum {
+                    file_id,
+                    precursors: vec![precursor],
+                    representation: Representation::Centroid,
+                    scan_start_time: f64::from(dda_precursor.rt()) as f32 / 60.0,
+                    ion_injection_time: f64::from(dda_precursor.rt()) as f32,
+                    total_ion_current,
+                    mz: spectrum
+                        .mz_values(mz_converter.clone())
+                        .iter()
+                        .map(|&x| f64::from(x) as f32)
+                        .collect(),
+                    ms_level: 2,
+                    id: spectrum.index().to_string(),
+                    intensity,
+                    mobility: None,
+                })
+            })
+            .collect();
+        Ok(spectra)
     }
 }
 
@@ -191,21 +373,25 @@ impl PeakBuffer {
         }
     }
 
-    fn with_frame(
+    /// Generic over the converters so a calibrated converter can drop in.
+    fn with_frame<M: Converter<TofIndex, Mz>, I: Converter<ScanIndex, Im>>(
         &mut self,
-        frame: &timsrust::Frame,
-        ims_converter: &Scan2ImConverter,
-        mz_converter: &Tof2MzConverter,
+        frame: &Frame,
+        ims_converter: &I,
+        mz_converter: &M,
     ) {
-        let expect_len = frame.tof_indices.len();
+        let tof_indices = frame.ions().tof_indices();
+        let intensities = frame.ions().intensities();
+        let scan_offsets = frame.ions().scan_offsets();
+
+        let expect_len = tof_indices.len();
         self.expand_to_capacity(expect_len);
 
-        let mz_iter = frame
-            .tof_indices
+        let mz_iter = tof_indices
             .iter()
-            .map(|&x| mz_converter.convert(x as f64) as f32);
-        let intensities_iter = frame.intensities.iter().map(|&x| x as f32);
-        let imss_iter = Self::expand_mobility_iter(&frame.scan_offsets, ims_converter);
+            .map(|&x| f64::from(mz_converter.convert(x)) as f32);
+        let intensities_iter = intensities.iter().map(|&x| u32::from(x) as f32);
+        let imss_iter = Self::expand_mobility_iter(scan_offsets, ims_converter);
 
         let peak_iter = mz_iter
             .zip(intensities_iter)
@@ -263,12 +449,12 @@ impl PeakBuffer {
     /// [0,0,0,0,1]; 0 to 4 have index 0, 4 to 5 have index 1, 5 to 5 would
     /// have index 2 but its empty!
     ///
-    /// Then this index can be converted using the Scan2ImConverter.convert
+    /// Then this index can be converted using the ims_converter.convert
     ///
     /// ... This should problably be implemented and exposed in timsrust.
-    fn expand_mobility_iter<'a>(
+    fn expand_mobility_iter<'a, I: Converter<ScanIndex, Im>>(
         scan_offsets: &'a [usize],
-        ims_converter: &'a Scan2ImConverter,
+        ims_converter: &'a I,
     ) -> impl Iterator<Item = f32> + 'a {
         let ims_iter = scan_offsets
             .windows(2)
@@ -281,7 +467,10 @@ impl PeakBuffer {
                 let lo = w[0];
                 let hi = w[1];
 
-                let im = ims_converter.convert(i as f64) as f32;
+                let Ok(scan_index) = ScanIndex::try_from(i as u32) else {
+                    return None;
+                };
+                let im = f64::from(ims_converter.convert(scan_index)) as f32;
                 Some((im, lo, hi))
             })
             .flat_map(|(im, lo, hi)| (lo..hi).map(move |_| im));
@@ -390,5 +579,22 @@ impl PeakBuffer {
             .drain(..)
             .map(|x| (x.mz, (x.intensity, x.im)))
             .unzip()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Configs written against the old `frame_splitting_params` knob must still load.
+    #[test]
+    fn ms2_config_ignores_legacy_frame_splitting_key() {
+        let cfg: BrukerMS2ProcessingConfig = serde_json::from_str(
+            r#"{"frame_splitting_params": {"Quadrupole": {"Even": 3}},
+                "spectrum_processing_params": {"smoothing_window": 3, "centroiding_window": 1,
+                                               "calibration_tolerance": 0.1, "calibrate": false}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.spectrum_processing_params.smoothing_window, 3);
     }
 }
